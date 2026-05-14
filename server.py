@@ -546,12 +546,12 @@ def get_gbpeur():
     r = fetch_yahoo("GBPEUR=X")
     return r["price"] if "price" in r else 1.15
 
-def to_eur(price, currency, eurusd):
+def to_eur(price, currency, eurusd, gbpeur=1.20):
     if price is None: return None
     c = currency.upper() if currency else "USD"
     if c == "EUR": return price
-    if c in ("GBP",): return price * 1.175
-    if c in ("GBp","GBX","PENCE"): return (price/100) * 1.175
+    if c in ("GBP",): return price * gbpeur
+    if c in ("GBp","GBX","PENCE"): return (price/100) * gbpeur
     return price / eurusd
 
 YAHOO_MAP = {
@@ -822,82 +822,99 @@ def update_analyst_targets(user_id: str):
         print(f"  [targets] {user_id}: updated {changed} analyst targets")
 
 def seed_history_from_yahoo(user_id: str):
-    """Build 3-month portfolio history and store in price_history table."""
-    tickers = db_all("SELECT id, symbol, yahoo_symbol, type FROM tickers WHERE user_id=?", (user_id,))
-    if not tickers: return {"error": "no tickers"}
+        """Build transaction-aware 3-month portfolio history and store in price_history."""
+        tickers = db_all("SELECT id, symbol, yahoo_symbol, type FROM tickers WHERE user_id=?", (user_id,))
+        if not tickers: return {"error": "no tickers"}
 
-    eurusd = get_eurusd()
-    CRYPTO = ("-USD","-EUR","-BTC","-ETH")
-    positions = []
-    for t in tickers:
-        ysym = t["yahoo_symbol"] or t["symbol"]
-        if any(ysym.upper().endswith(s) for s in CRYPTO): continue
-        tx_rows = db_all("SELECT type,shares,price FROM transactions WHERE ticker_id=? ORDER BY date", (t["id"],))
-        shares = 0.0; cost = 0.0
-        for tx in tx_rows:
-            if tx["type"] == "buy": cost += tx["shares"]*tx["price"]; shares += tx["shares"]
-            elif shares > 0:
-                avg = cost/shares; s = min(tx["shares"],shares); cost -= s*avg; shares -= s
-        if max(0.0, shares) > 0:
-            positions.append({"sym": ysym, "shares": max(0.0, shares)})
+        # Fetch all transactions grouped by ticker
+        all_tx = db_all("SELECT ticker_id, type, shares, date FROM transactions WHERE user_id=? ORDER BY date", (user_id,))
+        tx_by_ticker = {}
+        for tx in all_tx:
+            tid = tx["ticker_id"]
+            if tid not in tx_by_ticker: tx_by_ticker[tid] = []
+            tx_by_ticker[tid].append(tx)
 
-    if not positions: return {"error": "no positions"}
+        eurusd = get_eurusd()
+        gbpeur = get_gbpeur()
+        CRYPTO = ("-USD","-EUR","-BTC","-ETH")
 
-    from datetime import date as _date, timedelta as _td
-    daily_val = {}; daily_count = {}
+        ticker_history = {} # ticker_id -> { date: price_eur }
 
-    for pos in positions:
-        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/"
-               f"{urllib.parse.quote(pos['sym'])}?interval=1d&range=3mo")
-        try:
-            req = urllib.request.Request(url, headers=YAHOO_HEADERS)
-            with urllib.request.urlopen(req, timeout=15) as r:
-                j = json.loads(r.read().decode())
-            res    = j["chart"]["result"][0]
-            tss    = res.get("timestamp") or []
-            closes = res["indicators"]["quote"][0]["close"]
-            cur    = res["meta"].get("currency","USD").upper()
-            for ts, c in zip(tss, closes):
-                if c is None: continue
-                d = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
-                if _date.fromisoformat(d).weekday() >= 5: continue
-                p = to_eur(c, cur, eurusd) or 0
-                daily_val[d]   = daily_val.get(d, 0.0) + pos["shares"] * p
-                daily_count[d] = daily_count.get(d, 0) + 1
-        except Exception as e:
-            print(f"  [seed] {pos['sym']}: {e}")
+        for t in tickers:
+            ysym = t["yahoo_symbol"] or t["symbol"]
+            if any(ysym.upper().endswith(s) for s in CRYPTO): continue
 
-    if not daily_val: return {"error": "no data"}
+            url = (f"https://query1.finance.yahoo.com/v8/finance/chart/"
+                   f"{urllib.parse.quote(ysym)}?interval=1d&range=3mo")
+            try:
+                req = urllib.request.Request(url, headers=YAHOO_HEADERS)
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    j = json.loads(r.read().decode())
+                res    = j["chart"]["result"][0]
+                tss    = res.get("timestamp") or []
+                closes = res["indicators"]["quote"][0]["close"]
+                cur    = res["meta"].get("currency","USD").upper()
 
-    threshold = max(1, len(positions) * 0.5)
-    good = {d: v for d, v in daily_val.items()
-            if daily_count.get(d, 0) >= threshold and v > 0}
-    if not good: good = dict(daily_val)
+                h = {}
+                for ts, c in zip(tss, closes):
+                    if c is None: continue
+                    d = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+                    p = to_eur(c, cur, eurusd, gbpeur) or 0
+                    h[d] = p
+                ticker_history[t["id"]] = h
+            except Exception as e:
+                print(f"  [seed] {ysym}: {e}")
 
-    import random; random.seed(42)
-    sorted_days = sorted(good.items())
-    history = []
-    for i, (date_str, close_val) in enumerate(sorted_days):
-        prev_close = sorted_days[i-1][1] if i > 0 else close_val
-        hours = list(range(9, 18))
-        n = len(hours)
-        for j, hour in enumerate(hours):
-            t_ratio = j / (n - 1)
-            base = prev_close + (close_val - prev_close) * t_ratio
-            noise = (random.random() - 0.5) * 0.003 * base
-            history.append({"t": f"{date_str}T{hour:02d}:00", "v": round(base + noise, 2)})
-        history[-1]["v"] = round(close_val, 2)
+        if not ticker_history: return {"error": "no data fetched"}
 
-    # Save to DB
-    conn = get_db()
-    conn.execute("DELETE FROM price_history WHERE user_id=?", (user_id,))
-    for h in history:
-        conn.execute("INSERT OR REPLACE INTO price_history(user_id,timestamp,value_eur) VALUES(?,?,?)",
-                     (user_id, h["t"], h["v"]))
-    conn.commit()
-    return {"history": history, "points": len(history)}
+        # Unique dates across all fetched histories
+        all_dates = set()
+        for h in ticker_history.values():
+            all_dates.update(h.keys())
+        sorted_dates = sorted(list(all_dates))
 
+        daily_val = {}
+        for d_str in sorted_dates:
+            d_val = 0.0
+            for tid, prices in ticker_history.items():
+                shares = 0.0
+                for tx in tx_by_ticker.get(tid, []):
+                    if tx["date"][:10] <= d_str:
+                        if tx["type"] == "buy": shares += tx["shares"]
+                        else: shares -= tx["shares"]
+                    else: break
 
+                price = prices.get(d_str)
+                if price and shares > 0:
+                    d_val += shares * price
+
+            if d_val > 0:
+                daily_val[d_str] = d_val
+
+        if not daily_val: return {"error": "no data"}
+
+        import random; random.seed(42)
+        sorted_days = sorted(daily_val.items())
+        history = []
+        for i, (date_str, close_val) in enumerate(sorted_days):
+            prev_close = sorted_days[i-1][1] if i > 0 else close_val
+            hours = list(range(9, 18))
+            n = len(hours)
+            for j, hour in enumerate(hours):
+                t_ratio = j / (n - 1)
+                base = prev_close + (close_val - prev_close) * t_ratio
+                noise = (random.random() - 0.5) * 0.003 * base
+                history.append({"t": f"{date_str}T{hour:02d}:00", "v": round(base + noise, 2)})
+            history[-1]["v"] = round(close_val, 2)
+
+        # Save to DB
+        conn = get_db()
+        conn.execute("DELETE FROM price_history WHERE user_id=?", (user_id,))
+        for h in history:
+            conn.execute("INSERT OR REPLACE INTO price_history(user_id,timestamp,value_eur) VALUES(?,?,?)",
+                         (user_id, h["t"], h["v"]))
+        conn.commit()
+        return {"history": history, "points": len(history)}
 def resolve_yahoo_symbol(symbol):
     """Try symbol as-is first, then with exchange fallbacks for bare symbols."""
     if not symbol: return symbol
@@ -1565,15 +1582,15 @@ class Handler(BaseHTTPRequestHandler):
                     except: pass
 
             # ── Fetch chart data (5y daily + 2d intraday) ────────────────────
+            gbpeur = get_gbpeur()
             def to_eur(p, currency=None):
                 c = (currency or "USD").upper()
                 if p is None: return None
                 if c == "EUR": return p
-                if c in ("GBp","GBX","PENCE"): return (p/100)*1.175
-                if c == "GBP": return p*1.175
+                if c in ("GBp","GBX","PENCE"): return (p/100)*gbpeur
+                if c == "GBP": return p*gbpeur
                 return p/eurusd
 
-            gbpeur = get_gbpeur()
 
             def tp_to_eur(tp, us_sym):
                 """Convert target price considering the US symbol's currency."""

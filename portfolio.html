@@ -6121,8 +6121,8 @@ function Dashboard() {
   },[]);
 
   const built = useMemo(()=>dBuildHoldings(), [S.prices, S.tickers, S.txns, activeCurrency, euruah, eurUsdRate]);
-  const history = useMemo(()=>dFilterHistory(range), [range, S.history]);
-  const dayCh = useMemo(()=>dDayChange(), [S.history, activeCurrency]);
+  const history = useMemo(()=>dFilterHistory(range), [range, S.history, S.prices, S.txns, activeCurrency, euruah, eurUsdRate]);
+  const dayCh = useMemo(()=>dDayChange(), [S.history, S.prices, S.txns, activeCurrency, euruah, eurUsdRate]);
   // lang in key forces full re-render of children when language changes
   const langKey = lang;
 
