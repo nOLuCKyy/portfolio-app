@@ -619,34 +619,35 @@ def update_prices_cache(symbol, price, prev_close, day_pct, currency="EUR",
     )
 
 # ── Portfolio calculations ────────────────────────────────────────────────────
-def calc_portfolio_value_db(user_id: str) -> float:
+def calc_portfolio_value_db(user_id: str, allow_partial: bool = False) -> float:
     """Calculate total portfolio value from DB prices_cache."""
     tickers = db_all("SELECT id, symbol, yahoo_symbol FROM tickers WHERE user_id=?", (user_id,))
     eurusd = get_eurusd()
     gbpeur = get_gbpeur()
     total = 0.0
     for t in tickers:
-        # Use consistent symbol resolution
-        sym = YAHOO_MAP.get(t["symbol"].upper(), t["yahoo_symbol"] or t["symbol"])
-        price_row = db_one("SELECT price FROM prices_cache WHERE symbol=?", (sym,))
-        if not price_row or not price_row["price"]: continue
-        price = price_row["price"]
-        # Calculate shares
+        # Calculate current shares first
         tx_rows = db_all(
-            "SELECT type, shares, price, currency, fee FROM transactions WHERE ticker_id=? ORDER BY date",
+            "SELECT type, shares FROM transactions WHERE ticker_id=? ORDER BY date",
             (t["id"],)
         )
-        shares = 0.0; cost = 0.0
+        shares = 0.0
         for tx in tx_rows:
-            tx_price = to_eur(tx["price"], tx["currency"], eurusd, gbpeur)
-            tx_fee = to_eur(tx.get("fee", 0), tx["currency"], eurusd, gbpeur)
-            if tx["type"] == "buy":
-                cost += tx["shares"] * tx_price + tx_fee
-                shares += tx["shares"]
-            elif shares > 0:
-                avg = cost / shares; s = min(tx["shares"], shares)
-                cost -= s * avg; shares -= s
-        total += max(0.0, shares) * price
+            if tx["type"] == "buy": shares += tx["shares"]
+            else: shares -= max(0.0, min(shares, tx["shares"]))
+
+        if shares <= 0: continue
+
+        # We need a price for this ticker
+        sym = YAHOO_MAP.get(t["symbol"].upper(), t["yahoo_symbol"] or t["symbol"])
+        price_row = db_one("SELECT price FROM prices_cache WHERE symbol=?", (sym,))
+
+        if not price_row or not price_row["price"]:
+            if not allow_partial:
+                return -1.0 # Signal that calculation is incomplete
+            continue
+
+        total += shares * price_row["price"]
     return round(total, 2)
 
 def do_snapshot(user_id: str):
@@ -654,19 +655,10 @@ def do_snapshot(user_id: str):
     from datetime import date as _date
     if _date.today().weekday() >= 5: return
     now_dt = datetime.now()
-    if now_dt.hour < 7 or now_dt.hour >= 18: return
+    # Snapshots between 9:00 and 23:00 (to cover US markets)
+    if now_dt.hour < 9 or now_dt.hour >= 23: return
 
-    # Check enough prices loaded
-    tickers = db_all("SELECT id, yahoo_symbol, symbol FROM tickers WHERE user_id=?", (user_id,))
-    if not tickers: return
-    loaded = sum(1 for t in tickers if db_one(
-        "SELECT 1 FROM prices_cache WHERE symbol=? AND price IS NOT NULL",
-        (YAHOO_MAP.get(t["symbol"].upper(), t["yahoo_symbol"] or t["symbol"]),)
-    ))
-    if loaded < max(1, len(tickers) * 0.7):
-        return
-
-    v = calc_portfolio_value_db(user_id)
+    v = calc_portfolio_value_db(user_id, allow_partial=False)
     if v <= 0: return
 
     # Sanity check
@@ -931,15 +923,7 @@ def seed_history_from_yahoo(user_id: str):
     for h in ticker_history.values():
         all_ts.update(h.keys())
 
-    # Implementation of 30-day zero-lead-in
-    first_dt = datetime.fromisoformat(first_tx_date.split('T')[0])
-    lead_in_start_dt = first_dt - timedelta(days=30)
-    lead_in_start = lead_in_start_dt.strftime("%Y-%m-%d")
-    for i in range(31):
-        d = (first_dt - timedelta(days=30-i)).strftime("%Y-%m-%d")
-        all_ts.add(d + "T00:00")
-
-    sorted_ts = sorted([ts for ts in all_ts if ts[:10] >= lead_in_start])
+    sorted_ts = sorted([ts for ts in all_ts if ts[:10] >= first_tx_date[:10]])
 
     # Fill in gaps in ticker history (forward fill) to avoid dips
     filled_ticker_history = {}

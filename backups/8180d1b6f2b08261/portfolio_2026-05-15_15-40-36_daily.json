@@ -1,0 +1,20 @@
+{
+  "tickers": [],
+  "txns": {},
+  "targets": {},
+  "priceTgts": {},
+  "history": [],
+  "dayStart": {},
+  "marketList": [],
+  "settings": {
+    "accent": "#7c3aed",
+    "refreshMin": 15,
+    "autoRefresh": true,
+    "colors": {
+      "accent": "#7c3aed"
+    },
+    "xirr": null
+  },
+  "prices": {},
+  "dayChangePcts": {}
+}

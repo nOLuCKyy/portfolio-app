@@ -1589,11 +1589,18 @@ function getPositions(){
 }
 
 function getTotals(pos){
-  const tv=pos.reduce((s,r)=>s+(r.value??0),0);
+  let tv = 0;
+  let isPartial = false;
+  for(const r of pos){
+    if(r.shares > 0){
+      if(r.value == null){ isPartial = true; }
+      else { tv += r.value; }
+    }
+  }
   const tc=pos.reduce((s,r)=>s+r.totalCost,0);
   const totalRealized=pos.reduce((s,r)=>s+(r.realizedPnl||0),0);
   const dayP=pos.reduce((s,r)=>s+(r.dayPnl??0),0);
-  return{totalValue:tv,totalCost:tc,totalPnl:tv-tc,totalPnlPct:tc>0?(tv-tc)/tc*100:null,dayPnl:dayP,totalRealized};
+  return{totalValue:tv,totalCost:tc,totalPnl:tv-tc,totalPnlPct:tc>0?(tv-tc)/tc*100:null,dayPnl:dayP,totalRealized,isPartial};
 }
 
 function withWeight(pos){
@@ -3815,64 +3822,89 @@ function renderTransactions(){
     return;
   }
 
-  // ── Desktop transactions (new style) ──
-  el.innerHTML=`
-  <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border)">
-    <div style="display:flex;align-items:center;gap:10px">
-      <div style="font-size:16px;font-weight:700;color:var(--text)">${tr('Угоди')}</div>
-      <span style="font-size:11px;color:var(--text3)">${all.length} ${tr('записів')}</span>
+  // ── Desktop transactions (modern style) ──
+  el.innerHTML = `
+  <div style="padding: 20px 24px 10px;">
+    <div class="card market-toolbar" style="margin-bottom: 0; border-radius: var(--radius) var(--radius) 0 0; padding: 14px 20px;">
+      <div style="display: flex; align-items: baseline; gap: 12px;">
+        <div style="font-size: 16px; font-weight: 700; color: var(--text)">${tr('Угоди')}</div>
+        <div style="font-size: 13px; color: var(--text3)">${all.length} ${tr('записів')}</div>
+      </div>
+
+      <div class="market-chips" style="margin-left: 24px; display: flex; gap: 6px;">
+        <button class="chip-btn ${!txnFilter ? 'active' : ''}" onclick="txnFilter='';renderTransactions()">${tr('Всі')}</button>
+        <button class="chip-btn ${txnFilter === 'buy' ? 'active' : ''}" onclick="txnFilter='buy';renderTransactions()">${tr('Купівля')}</button>
+        <button class="chip-btn ${txnFilter === 'sell' ? 'active' : ''}" onclick="txnFilter='sell';renderTransactions()">${tr('Продаж')}</button>
+      </div>
+
+      <div style="margin-left: auto; display: flex; gap: 12px; align-items: center;">
+        <div class="d-search" style="min-width: 180px;">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--text3)" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+          <input placeholder="${tr('Пошук...')}" value="${esc(txnFilter && txnFilter!=='buy' && txnFilter!=='sell' ? txnFilter : '')}"
+                 oninput="txnFilter=this.value;renderTransactions()"/>
+        </div>
+
+        <div style="display:flex; background:var(--card-2); border-radius:10px; padding:3px; gap:2px; border: 1px solid var(--border);">
+          <button class="subtab-btn ${txnSort === 'date_desc' ? 'active' : ''}" style="padding: 4px 10px; font-size: 11px; border: none; border-radius: 7px; margin-bottom: 0;" onclick="txnSort='date_desc';renderTransactions()">Нові</button>
+          <button class="subtab-btn ${txnSort === 'date_asc' ? 'active' : ''}" style="padding: 4px 10px; font-size: 11px; border: none; border-radius: 7px; margin-bottom: 0;" onclick="txnSort='date_asc';renderTransactions()">Старі</button>
+        </div>
+      </div>
     </div>
-    <div style="display:flex;align-items:center;gap:8px">
-      <select class="fi" style="font-size:12px;padding:6px 10px" onchange="txnFilter=this.value;renderTransactions()">
-        <option value="">${tr('Всі типи')}</option>
-        <option value="buy" ${txnFilter==='buy'?'selected':''}>${tr('Купівля')}</option>
-        <option value="sell" ${txnFilter==='sell'?'selected':''}>${tr('Продаж')}</option>
-        ${symbols.map(s=>`<option value="${esc(s)}" ${txnFilter===s?"selected":""}>${esc(s)}</option>`).join("")}
-      </select>
-      <select class="fi" style="font-size:12px;padding:6px 10px" onchange="txnSort=this.value;renderTransactions()">
-        <option value="date_desc" ${txnSort==="date_desc"?"selected":""}>Нові спочатку</option>
-        <option value="date_asc"  ${txnSort==="date_asc" ?"selected":""}>Старі спочатку</option>
-        <option value="symbol"    ${txnSort==="symbol"   ?"selected":""}>A–Z</option>
-      </select>
+
+    <div class="card" style="padding: 0; border-top: none; border-radius: 0 0 var(--radius) var(--radius); background: var(--bg2);">
+      ${all.length === 0
+        ? `<div style="padding: 60px; text-align: center; color: var(--text3); font-size: 13px;">${tr('Немає транзакцій')}</div>`
+        : `<div style="overflow-x: auto;">
+            <table class="table market-table">
+              <thead>
+                <tr>
+                  <th style="padding-left: 20px;">${tr('ТІКЕР')}</th>
+                  <th>${tr('ТИП')}</th>
+                  <th>${tr('ДАТА')}</th>
+                  <th class="right">${tr('К-СТЬ')}</th>
+                  <th class="right">${tr('ЦІНА')}</th>
+                  <th class="right">${tr('СУМА')}</th>
+                  <th style="width: 80px;"></th>
+                </tr>
+              </thead>
+              <tbody>
+                ${all.map(tx => {
+                  const isBuy = tx.type === 'buy';
+                  const sum = (tx.shares || 0) * tx.price;
+                  const dateStr = tx.date ? new Date(tx.date).toLocaleDateString('uk-UA', { day: '2-digit', month: '2-digit', year: 'numeric' }) : '—';
+                  const col = _mobAv(tx.symbol || '?');
+                  return `
+                    <tr onclick="editTx(${tx.tickerId}, '${tx.id}')">
+                      <td style="padding-left: 20px;">
+                        <div class="tkr">
+                          <div class="tkr-avatar" style="background: ${col}; width: 30px; height: 30px; font-size: 9px;">${esc((tx.symbol || '').slice(0, 2))}</div>
+                          <div>
+                            <div class="tkr-name" style="font-size: 13px;">${esc(tx.symbol)}</div>
+                            <div class="tkr-sub" style="font-size: 10px;">${esc(tx.name)}</div>
+                          </div>
+                        </div>
+                      </td>
+                      <td>
+                        <span class="tx-type-pill ${tx.type}">${isBuy ? tr('Купівля') : tr('Продаж')}</span>
+                      </td>
+                      <td class="mono" style="color: var(--text2); font-size: 12px;">${dateStr}</td>
+                      <td class="right mono" style="font-size: 12px;">${f4(tx.shares)}</td>
+                      <td class="right mono" style="font-size: 12px;">${eur(tx.price)}</td>
+                      <td class="right mono" style="font-size: 13px; font-weight: 600; color: ${isBuy ? 'var(--up)' : 'var(--down)'};">
+                        ${isBuy ? '+' : '−'}${eur(sum)}
+                      </td>
+                      <td class="right" style="padding-right: 20px;">
+                         <button class="btn sm" style="padding: 4px 8px; border: none; background: transparent; color: var(--text3);" onclick="confirmDeleteTx(${tx.tickerId},'${tx.id}',event)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>
+                      </td>
+                    </tr>
+                  `;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>`
+      }
     </div>
   </div>
-  ${all.length===0
-    ? `<div style="padding:60px;text-align:center;color:var(--text3);font-size:13px">Немає транзакцій</div>`
-    : `<div style="overflow-x:auto">
-    <table class="dt">
-      <thead><tr>
-        <th style="text-align:left">${tr('Актив')}</th>
-        <th>${tr('Тип')}</th>
-        <th>${tr('Дата')}</th>
-        <th>${tr('Кількість')}</th>
-        <th>${tr('Ціна')} €</th>
-        <th>${tr('Сума')} €</th>
-        <th></th>
-      </tr></thead>
-      <tbody>
-      ${all.map(tx=>{
-        const isBuy = tx.type==="buy";
-        const sum = (tx.shares||tx.qty||0)*tx.price;
-        const dateStr = tx.date ? new Date(tx.date).toLocaleDateString("uk-UA",{day:"2-digit",month:"2-digit",year:"numeric"}) : "—";
-        const col = _mobAv(tx.symbol||'?');
-        return`<tr>
-          <td><div class="tkr">
-            <div class="tkr-avatar" style="background:${col}">${esc((tx.symbol||'').slice(0,2))}</div>
-            <div><div class="tkr-name">${esc(tx.symbol)}</div><div class="tkr-sub">${esc(tx.name)}</div></div>
-          </div></td>
-          <td style="text-align:right"><span class="tx-pill ${isBuy?'buy':'sell'}">${isBuy?'BUY':'SELL'}</span></td>
-          <td style="text-align:right;font-size:12px;color:var(--fg-2)">${dateStr}</td>
-          <td style="text-align:right" class="mono" style="color:var(--fg-2)">${f4(tx.shares||tx.qty||0)}</td>
-          <td style="text-align:right" class="mono">${eur(tx.price)}</td>
-          <td style="text-align:right;font-weight:600" class="mono" style="color:${isBuy?'var(--up)':'var(--down)'}">${isBuy?'+':'-'}${eur(sum)}</td>
-          <td style="white-space:nowrap;text-align:right">
-            <button class="btn sm" style="margin-right:4px" onclick="editTx(${tx.tickerId},'${tx.id}')">Ред.</button>
-            <button class="btn sm" style="color:var(--down)" onclick="confirmDeleteTx(${tx.tickerId},'${tx.id}')">✕</button>
-          </td>
-        </tr>`;
-      }).join("")}
-      </tbody>
-    </table></div>`}`;
 }
 
 function deleteTxFromList(tickerId, txId){
@@ -5472,39 +5504,48 @@ function dDayChange() {
 }
 function dFilterHistory(range) {
   const h = S.history || [];
-  if (!h.length) return [];
   const now = new Date();
-  // Compute live current value to append as latest point
+
+  // 1. Calculate Live Total accurately
   let liveV = null;
   try {
     const pos = getPositions();
     const T = getTotals(pos);
-    if(T && T.totalValue != null && !isNaN(T.totalValue) && T.totalValue > 0) liveV = T.totalValue;
+    // Only use live total if all active positions have prices
+    if(!T.isPartial && T.totalValue > 0) liveV = T.totalValue;
   } catch(e){}
+
   const appendLive = (arr) => {
     if(liveV == null) return arr;
-    if(!arr.length) return [{ t: now.toISOString(), v: liveV }];
+    const nowISO = new Date().toISOString();
+    if(!arr.length) return [{ t: nowISO, v: liveV }];
 
     const last = arr[arr.length-1];
     const lastT = new Date(last.t);
+    const diffSec = (new Date() - lastT) / 1000;
 
-    // Always force the exact live value at the end if it's the 1d view or within 1 hour of last point
-    const diffHours = (now - lastT) / 3600000;
-    if (diffHours < 1 || range === '1d') {
-        // If the last point is very close in time, replace it to avoid "tail stutter"
-        if ((now - lastT) < 60000) {
-            const newArr = [...arr];
-            newArr[newArr.length-1] = { t: now.toISOString(), v: liveV };
-            return newArr;
-        }
-        return [...arr, { t: now.toISOString(), v: liveV }];
+    // If last point is within 60s, replace it; else append
+    if (diffSec < 60) {
+      const newArr = [...arr];
+      newArr[newArr.length-1] = { t: nowISO, v: liveV };
+      return newArr;
     }
-    return [...arr, { t: now.toISOString(), v: liveV }];
+    return [...arr, { t: nowISO, v: liveV }];
   };
+
   if (range==='1d') {
-    const allDates = [...new Set(h.map(p=>p.t.slice(0,10)))].sort();
-    const lastDate = allDates[allDates.length-1];
-    return appendLive(h.filter(p=>p.t.slice(0,10)===lastDate).sort((a,b)=>a.t.localeCompare(b.t)));
+    const todayStr = now.toISOString().slice(0,10);
+    const todayPts = h.filter(p=>p.t.slice(0,10)===todayStr);
+
+    if (todayPts.length > 0) {
+      return appendLive(todayPts.sort((a,b)=>a.t.localeCompare(b.t)));
+    } else {
+      const allDates = [...new Set(h.map(p=>p.t.slice(0,10)))].sort();
+      if(!allDates.length) return appendLive([]);
+      const lastDate = allDates[allDates.length-1];
+      const lastDayPts = h.filter(p=>p.t.slice(0,10)===lastDate).sort((a,b)=>a.t.localeCompare(b.t));
+      return (lastDate === todayStr) ? appendLive(lastDayPts) : lastDayPts;
+    }
   }
   // For "all": anchor to first transaction date with synthetic invested-value point
   if (range==='all') {
