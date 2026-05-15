@@ -937,6 +937,7 @@ def seed_history_from_yahoo(user_id: str):
 
     # Calculate portfolio value at each timestamp
     history = []
+    has_started = False
     for ts_str in sorted_ts:
         v = 0.0
         any_val = False
@@ -956,8 +957,11 @@ def seed_history_from_yahoo(user_id: str):
                 v += shares * prices[ts_str]
                 any_val = True
 
-        # Always add lead-in points (v=0) or calculated points
-        if any_val or ts_str < first_tx_date:
+        # Only start history from the first point where portfolio has value
+        if v > 0.01:
+            has_started = True
+
+        if has_started:
             history.append({"t": ts_str, "v": round(v, 2)})
 
     if not history: return {"error": "no history generated"}
