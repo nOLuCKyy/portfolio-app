@@ -1,0 +1,14 @@
+{
+  "tickers": [],
+  "txns": {},
+  "targets": {},
+  "priceTgts": {},
+  "history": [],
+  "dayStart": {},
+  "marketList": [],
+  "settings": {
+    "xirr": null
+  },
+  "prices": {},
+  "dayChangePcts": {}
+}

@@ -835,17 +835,40 @@ def seed_history_from_yahoo(user_id: str):
         if tid not in tx_by_ticker: tx_by_ticker[tid] = []
         tx_by_ticker[tid].append(tx)
 
-    eurusd = get_eurusd()
-    gbpeur = get_gbpeur()
+    # 1. Fetch historical FX rates for last 3 months
+    def fetch_hist_fx(symbol):
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}?interval=1d&range=3mo"
+        try:
+            req = urllib.request.Request(url, headers=YAHOO_HEADERS)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                j = json.loads(r.read().decode())
+            res = j["chart"]["result"][0]
+            tss = res.get("timestamp") or []
+            closes = res["indicators"]["quote"][0]["close"]
+            h = {}
+            for ts, c in zip(tss, closes):
+                if c is None: continue
+                d = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+                h[d] = c
+            return h
+        except: return {}
 
-    ticker_history = {} # ticker_id -> { date: price_eur }
+    hist_eurusd = fetch_hist_fx("EURUSD=X")
+    hist_gbpeur = fetch_hist_fx("GBPEUR=X")
+
+    # Fallbacks to current rates
+    cur_eurusd = get_eurusd()
+    cur_gbpeur = get_gbpeur()
+
+    ticker_history = {} # ticker_id -> { timestamp: price_eur }
 
     for t in tickers:
         sym = t["symbol"].upper()
         ysym = YAHOO_MAP.get(sym, t["yahoo_symbol"] or t["symbol"])
 
+        # Fetch hourly data for 3 months
         url = (f"https://query1.finance.yahoo.com/v8/finance/chart/"
-               f"{urllib.parse.quote(ysym)}?interval=1d&range=3mo")
+               f"{urllib.parse.quote(ysym)}?interval=1h&range=3mo")
         try:
             req = urllib.request.Request(url, headers=YAHOO_HEADERS)
             with urllib.request.urlopen(req, timeout=15) as r:
@@ -858,89 +881,59 @@ def seed_history_from_yahoo(user_id: str):
             h = {}
             for ts, c in zip(tss, closes):
                 if c is None: continue
-                d = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
-                p = to_eur(c, cur, eurusd, gbpeur) or 0
-                h[d] = p
+                # ISO format including hour
+                dt = datetime.fromtimestamp(ts, timezone.utc)
+                ts_str = dt.strftime("%Y-%m-%dT%H:%M")
+                d_str  = dt.strftime("%Y-%m-%d")
+
+                # Use historical FX for that specific date
+                fx_usd = hist_eurusd.get(d_str, cur_eurusd)
+                fx_gbp = hist_gbpeur.get(d_str, cur_gbpeur)
+                p = to_eur(c, cur, fx_usd, fx_gbp) or 0
+                h[ts_str] = p
             ticker_history[t["id"]] = h
         except Exception as e:
             print(f"  [seed] {ysym}: {e}")
 
     if not ticker_history: return {"error": "no data fetched"}
 
-    all_dates = set()
+    all_ts = set()
     for h in ticker_history.values():
-        all_dates.update(h.keys())
-    sorted_dates = sorted(list(all_dates))
+        all_ts.update(h.keys())
+    sorted_ts = sorted(list(all_ts))
 
-    ticker_history_filled = {}
-    for tid, h in ticker_history.items():
+    # Fill in gaps in ticker history (forward fill) to avoid dips
+    filled_ticker_history = {}
+    for tid, prices in ticker_history.items():
         filled = {}
         last_p = None
-        for d in sorted_dates:
-            if d in h: last_p = h[d]
-            if last_p is not None: filled[d] = last_p
-        ticker_history_filled[tid] = filled
+        for ts in sorted_ts:
+            if ts in prices: last_p = prices[ts]
+            if last_p is not None: filled[ts] = last_p
+        filled_ticker_history[tid] = filled
 
-    daily_val = {}
-    from datetime import datetime as _dt, timezone as _tz
-    now_utc = _dt.now(_tz.utc)
-    today_str = now_utc.strftime("%Y-%m-%d")
-    current_hour = now_utc.hour
-
-    import random
-    random.seed(42)
+    # Calculate portfolio value at each hourly timestamp
     history = []
+    for ts_str in sorted_ts:
+        v = 0.0
+        any_val = False
+        for tid, prices in filled_ticker_history.items():
+            if ts_str not in prices: continue
 
-    for i, date_str in enumerate(sorted_dates):
-        d_val = 0.0
-        # Calculate daily value - using holdings at end of day
-        for tid, prices in ticker_history_filled.items():
+            # Calculate shares at this specific timestamp
             shares = 0.0
             for tx in tx_by_ticker.get(tid, []):
-                if tx["date"][:10] <= date_str:
+                if tx["date"] <= ts_str:
                     if tx["type"] == "buy": shares += tx["shares"]
                     else: shares -= tx["shares"]
                 else: break
 
-            p = prices.get(date_str)
-            if p and shares > 0:
-                d_val += shares * p
+            if shares > 0:
+                v += shares * prices[ts_str]
+                any_val = True
 
-        if d_val <= 0: continue
-
-        # Generate hourly points for smooth chart
-        prev_val = history[-1]["v"] if history else d_val
-        hours = list(range(9, 18))
-        if date_str == today_str:
-            # If today, only generate up to current hour to match live data point later
-            hours = [h for h in hours if h <= current_hour]
-            if not hours: continue
-
-        n = len(hours)
-        for j, hour in enumerate(hours):
-            # Check holdings specifically at this hour if transactions exist today
-            ts_hour = f"{date_str}T{hour:02d}:00"
-            h_val = 0.0
-            for tid, prices in ticker_history_filled.items():
-                shares = 0.0
-                for tx in tx_by_ticker.get(tid, []):
-                    if tx["date"] <= ts_hour:
-                        if tx["type"] == "buy": shares += tx["shares"]
-                        else: shares -= tx["shares"]
-                    else: break
-                p = prices.get(date_str)
-                if p and shares > 0: h_val += shares * p
-
-            # base uses linear interpolation between prev daily close and current hourly value
-            t_ratio = (j + 1) / n
-            base = prev_val + (h_val - prev_val) * t_ratio
-            history.append({"t": ts_hour, "v": round(base, 2)})
-
-        # Ensure the last point of the day matches the end-of-day calculation
-        # Exception: for today, we want it to stay at the interpolated base
-        # so the transition to the frontend "live" point is smooth.
-        if date_str != today_str:
-            history[-1]["v"] = round(d_val, 2)
+        if any_val and v > 0:
+            history.append({"t": ts_str, "v": round(v, 2)})
 
     if not history: return {"error": "no history generated"}
 

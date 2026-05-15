@@ -5414,82 +5414,39 @@ function dTickerColor(symbol) {
   return `oklch(0.58 0.16 ${h % 360})`;
 }
 function dBuildHoldings() {
-  const rows = S.tickers.map(t => {
-    const tid = String(t.id);
-    const txlist = S.txns[t.id] || [];
-    let shares = 0, cost = 0;
-    [...txlist].sort((a,b)=>(a.date||'').localeCompare(b.date||'')).forEach(tx => {
-      if (tx.type === 'buy') { cost += tx.shares * tx.price; shares += tx.shares; }
-      else if (shares > 0) { const avg = cost/shares; const s = Math.min(tx.shares, shares); cost -= s*avg; shares -= s; }
-    });
-    shares = Math.max(0, shares);
-    const price = S.prices[t.id] || 0;
-    const fxPrice = toActiveCurrency(price);
-    const value = toActiveCurrency(shares * price);
-    const costFx = toActiveCurrency(cost);
-    const pl = value - costFx;
-    const plPct = costFx > 0 ? (pl / costFx) * 100 : 0;
-    const target = S.targets[t.id] || 0;
-    const priceTgt = toActiveCurrency(S.priceTgts?.[t.id] || null);
-    const upside = priceTgt && fxPrice ? ((priceTgt - fxPrice) / fxPrice) * 100 : null;
-    const avgPrice = shares > 0 ? toActiveCurrency(cost / shares) : 0;
-    const mkt = marketPrices[t.yahooSymbol||t.symbol];
-    const dayPct = S.dayChangePcts?.[t.id] ?? mkt?.dayPct ?? null;
-    return { id: t.id, tid, symbol: t.symbol, name: t.name, type: t.type||'stock',
-      shares, cost: costFx, avgPrice, price: fxPrice, value, pl, plPct, target, priceTgt, upside, dayPct };
-  });
-  const totalVal = rows.reduce((s,r)=>s+r.value, 0);
-  const totalCost = rows.reduce((s,r)=>s+r.cost, 0);
+  const pos = getPositions();
+  const T = getTotals(pos);
+  const rows = pos.map(r => ({
+    ...r,
+    tid: String(r.id),
+    cost: toActiveCurrency(r.totalCost),
+    avgPrice: toActiveCurrency(r.avgPrice),
+    price: toActiveCurrency(r.price),
+    value: toActiveCurrency(r.value),
+    pl: toActiveCurrency(r.pnl),
+    plPct: r.pnlPct,
+    target: r.targetPct,
+    actualPct: T.totalValue > 0 ? (r.value / T.totalValue) * 100 : 0
+  }));
+
   return {
-    rows: rows.map(r => ({ ...r, actualPct: totalVal > 0 ? (r.value/totalVal)*100 : 0 })),
-    total: { value: totalVal, cost: totalCost, pl: totalVal-totalCost, plPct: totalCost>0?((totalVal-totalCost)/totalCost)*100:0, realized: S.tickers.reduce((s,t)=>s+(calcPos(S.txns[t.id]||[]).realizedPnl||0),0) }
+    rows,
+    total: {
+      value: toActiveCurrency(T.totalValue),
+      cost: toActiveCurrency(T.totalCost),
+      pl: toActiveCurrency(T.totalPnl),
+      plPct: T.totalPnlPct,
+      realized: toActiveCurrency(T.totalRealized)
+    }
   };
 }
 function dDayChange() {
-  const today = new Date().toISOString().slice(0,10);
-  const ds = S.dayStart || {};
-  const dsDate = ds.date || '';
-  const dsPrices = ds.prices || {};
-  const NO_DATA = { abs: 0, pct: 0, _noData: true };
-
-  // Only use dayStart if it's from TODAY
-  if (dsDate === today && Object.keys(dsPrices).length > 0) {
-    let curVal = 0, startVal = 0;
-    for (const t of S.tickers) {
-      const tid = String(t.id);
-      const curPrice = S.prices[t.id] || 0;
-      const startPrice = parseFloat(dsPrices[tid] || dsPrices[t.id] || 0);
-      if (!curPrice || !startPrice) continue;
-      // Estimate shares from positions
-      const txList = S.txns[t.id] || [];
-      let shares = 0, cost = 0;
-      [...txList].sort((a,b)=>(a.date||'').localeCompare(b.date||'')).forEach(tx=>{
-        if(tx.type==='buy'){ cost+=tx.shares*tx.price; shares+=tx.shares; }
-        else if(shares>0){ const avg=cost/shares; const s=Math.min(tx.shares,shares); cost-=s*avg; shares-=s; }
-      });
-      shares = Math.max(0, shares);
-      if(shares <= 0) continue;
-      curVal   += toActiveCurrency(shares * curPrice);
-      startVal += toActiveCurrency(shares * startPrice);
-    }
-    if (startVal > 0) {
-      return { abs: curVal - startVal, pct: ((curVal - startVal) / startVal) * 100 };
-    }
-  }
-
-  // Fallback: use history — only if we have snapshots from TODAY
-  const h = S.history || [];
-  if (h.length < 2) return NO_DATA;
-  const lastSnap = h[h.length-1];
-  // Only show if last snapshot is from today
-  if (lastSnap.t.slice(0,10) !== today) return NO_DATA;
-  // Find first snapshot of today as baseline
-  const todaySnaps = h.filter(p => p.t.slice(0,10) === today);
-  if (todaySnaps.length < 2) return NO_DATA;
-  const firstToday = todaySnaps[0];
-  const lastFx = toActiveCurrency(lastSnap.v);
-  const prevFx = toActiveCurrency(firstToday.v);
-  return { abs: lastFx - prevFx, pct: prevFx > 0 ? ((lastFx - prevFx) / prevFx) * 100 : 0 };
+  const pos = getPositions();
+  const T = getTotals(pos);
+  const abs = toActiveCurrency(T.dayPnl);
+  const prevVal = T.totalValue - T.dayPnl;
+  const pct = prevVal > 0 ? (T.dayPnl / prevVal) * 100 : 0;
+  return { abs, pct, _noData: T.dayPnl == null };
 }
 function dFilterHistory(range) {
   const h = S.history || [];
@@ -5505,10 +5462,13 @@ function dFilterHistory(range) {
   const appendLive = (arr) => {
     if(liveV == null || !arr.length) return arr;
     const last = arr[arr.length-1];
+    // Skip if last snapshot is from the future (sanity check)
+    if(new Date(last.t) > now) return arr;
     // Skip if last snapshot is very recent (< 5 min) AND values are close
     const lastT = new Date(last.t);
     const ageSec = (now - lastT) / 1000;
     if(ageSec < 60 && Math.abs(last.v - liveV) / last.v < 0.001) return arr;
+    // For 1d chart, if last point is yesterday, we need to ensure the gap doesn't look weird
     return [...arr, { t: now.toISOString(), v: liveV }];
   };
   if (range==='1d') {
