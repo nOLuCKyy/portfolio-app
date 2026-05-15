@@ -2006,8 +2006,8 @@ function renderChart(){
   let xDomain = d3.extent(parsed, d => d.t);
   if (S.chartRange === "1d" && parsed.length > 0) {
     const d0 = new Date(parsed[0].t);
-    const dStart = new Date(d0.getTime()); dStart.setHours(9, 0, 0, 0);
-    const dEnd = new Date(d0.getTime()); dEnd.setHours(21, 0, 0, 0);
+    const dStart = new Date(d0); dStart.setHours(9, 0, 0, 0);
+    const dEnd = new Date(d0); dEnd.setHours(23, 0, 0, 0);
     xDomain = [d3.min([d0, dStart]), d3.max([new Date(parsed[parsed.length - 1].t), dEnd])];
   }
   const xScale=d3.scaleTime().domain(xDomain).range([0,iw]);
@@ -5622,8 +5622,8 @@ function DChart({ history, range, onHover, lang: compLang }) {
   let xDomainT = d3.extent(pts, p => new Date(p.t));
   if (range === '1d' && pts.length > 0) {
     const d0 = new Date(pts[0].t);
-    const dStart = new Date(d0.getTime()); dStart.setHours(9, 0, 0, 0);
-    const dEnd = new Date(d0.getTime()); dEnd.setHours(21, 0, 0, 0);
+    const dStart = new Date(d0); dStart.setHours(9, 0, 0, 0);
+    const dEnd = new Date(d0); dEnd.setHours(23, 0, 0, 0);
     xDomainT = [d3.min([d0, dStart]), d3.max([new Date(pts[pts.length - 1].t), dEnd])];
   }
   const xScaleT = d3.scaleTime().domain(xDomainT).range([padL, padL + iw]);

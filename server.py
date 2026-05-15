@@ -585,6 +585,7 @@ def fetch_market():
         if _market_cache["data"] and (time.time() - _market_cache["ts"]) < 60:
             return _market_cache["data"]
     eurusd = get_eurusd()
+    gbpeur = get_gbpeur()
     result = {}
     lock2  = threading.Lock()
 
@@ -621,6 +622,8 @@ def update_prices_cache(symbol, price, prev_close, day_pct, currency="EUR",
 def calc_portfolio_value_db(user_id: str) -> float:
     """Calculate total portfolio value from DB prices_cache."""
     tickers = db_all("SELECT id, symbol, yahoo_symbol FROM tickers WHERE user_id=?", (user_id,))
+    eurusd = get_eurusd()
+    gbpeur = get_gbpeur()
     total = 0.0
     for t in tickers:
         # Use consistent symbol resolution
@@ -630,13 +633,16 @@ def calc_portfolio_value_db(user_id: str) -> float:
         price = price_row["price"]
         # Calculate shares
         tx_rows = db_all(
-            "SELECT type, shares, price FROM transactions WHERE ticker_id=? ORDER BY date",
+            "SELECT type, shares, price, currency, fee FROM transactions WHERE ticker_id=? ORDER BY date",
             (t["id"],)
         )
         shares = 0.0; cost = 0.0
         for tx in tx_rows:
+            tx_price = to_eur(tx["price"], tx["currency"], eurusd, gbpeur)
+            tx_fee = to_eur(tx.get("fee", 0), tx["currency"], eurusd, gbpeur)
             if tx["type"] == "buy":
-                cost += tx["shares"] * tx["price"]; shares += tx["shares"]
+                cost += tx["shares"] * tx_price + tx_fee
+                shares += tx["shares"]
             elif shares > 0:
                 avg = cost / shares; s = min(tx["shares"], shares)
                 cost -= s * avg; shares -= s
