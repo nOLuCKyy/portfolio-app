@@ -1433,67 +1433,81 @@ function showToast(msg,err=false){
 
 // ─── TTWROR (True Time-Weighted Rate of Return) ──────────────────────────────
 function calcTtwror(){
-  // True TTWROR: r_i = (V_end_before_flow - V_start) / V_start
-  // V_end_before_flow = V_end - CF_at_end (subtract cashflows that happened on end day)
+  // True TTWROR: sub-period returns between cashflow events
+  // For each period between transactions: r = (V_end_before_tx / V_start_after_prev_tx) - 1
+  // V_start of first period = value on day of first transaction
+  // V_end of each period = value on day BEFORE next transaction (or today)
+
   const hist = (S.history||[]).slice().sort((a,b)=>new Date(a.t)-new Date(b.t));
   if(hist.length < 2) return null;
 
-  // Build daily value map
+  // Build daily value map (last snapshot of each day)
   const dayVal = {};
   hist.forEach(p=>{ dayVal[p.t.slice(0,10)] = p.v; });
   const sortedDays = Object.keys(dayVal).sort();
   if(sortedDays.length < 2) return null;
 
-  // Build daily cashflow map: net money invested per day
-  // buy = +money in, sell = -money in
-  const dayCF = {};
-  Object.values(S.txns||{}).forEach(list=>{
-    (list||[]).forEach(tx=>{
-      const day = (tx.date||'').slice(0,10);
-      if(!day) return;
-      const fee = tx.fee||0;
-      const cf = tx.type==='buy'
-        ? (tx.shares*tx.price + fee)
-        : -(tx.shares*tx.price - fee);
-      dayCF[day] = (dayCF[day]||0) + cf;
-    });
-  });
+  // Helper: get portfolio value on or nearest to a date
+  const getVal = (day) => {
+    if(dayVal[day]) return dayVal[day];
+    // Find nearest available day
+    const after = sortedDays.find(d => d >= day);
+    if(after) return dayVal[after];
+    return dayVal[sortedDays[sortedDays.length-1]];
+  };
 
-  // Walk consecutive daily snapshots
+  // Collect all unique transaction dates, sorted
+  const txDates = new Set();
+  Object.values(S.txns||{}).forEach(list=>{
+    (list||[]).forEach(tx=>{ if(tx.date) txDates.add(tx.date.slice(0,10)); });
+  });
+  const sortedTxDates = [...txDates].sort();
+  if(!sortedTxDates.length) return null;
+
+  // Build sub-periods: [start, end] pairs
+  // Each period ends the day BEFORE the next transaction
+  // Last period ends today
+  const lastDay = sortedDays[sortedDays.length-1];
+  const periods = [];
+  for(let i=0; i<sortedTxDates.length; i++){
+    const start = sortedTxDates[i];
+    // End = day before next tx, or last available day
+    let end;
+    if(i < sortedTxDates.length-1){
+      // day before next tx
+      const nextTx = new Date(sortedTxDates[i+1]);
+      nextTx.setDate(nextTx.getDate()-1);
+      end = nextTx.toISOString().slice(0,10);
+    } else {
+      end = lastDay;
+    }
+    if(end < start) end = start;
+    periods.push({start, end});
+  }
+
+  // Compute product of sub-period returns
   let product = 1;
   let periodsUsed = 0;
 
-  for(let i=1; i<sortedDays.length; i++){
-    const prevDay = sortedDays[i-1];
-    const curDay  = sortedDays[i];
-    const vStart  = dayVal[prevDay];
-    const vEnd    = dayVal[curDay];
-    if(!vStart || vStart <= 0 || !vEnd) continue;
+  for(const {start, end} of periods){
+    const vStart = getVal(start);
+    const vEnd   = getVal(end);
+    if(!vStart || vStart <= 0 || !vEnd || vEnd <= 0) continue;
+    if(start === end) continue; // same day, skip
 
-    // Cashflow on prevDay adjusts start (flow at start of period)
-    const cfStart = dayCF[prevDay] || 0;
-    const adjStart = vStart; // V_start already includes cfStart (snapshot taken after tx)
+    const r = vEnd / vStart - 1;
 
-    // r = (V_end - CF_end) / V_start_adjusted
-    // CF at end day = new money added on curDay
-    const cfEnd = dayCF[curDay] || 0;
-    const vEndBeforeFlow = vEnd - cfEnd;
-
-    if(adjStart <= 0 || vEndBeforeFlow <= 0) continue;
-    const r = (vEndBeforeFlow - adjStart) / adjStart;
-
-    // Skip unreasonable values (bad data)
-    if(r < -0.5 || r > 2) continue;
+    // Sanity: skip extreme values (bad data)
+    if(r < -0.99 || r > 10) continue;
 
     product *= (1 + r);
     periodsUsed++;
   }
 
-  if(periodsUsed < 2) return null;
+  if(periodsUsed < 1) return null;
 
   // Annualize
   const firstDay = sortedDays[0];
-  const lastDay  = sortedDays[sortedDays.length-1];
   const days = (new Date(lastDay) - new Date(firstDay)) / (1000*60*60*24);
   if(days < 7) return (product - 1) * 100;
   const annualized = (Math.pow(product, 365/days) - 1) * 100;
@@ -5495,26 +5509,11 @@ function dFilterHistory(range) {
   const h = S.history || [];
   if (!h.length) return [];
   const now = new Date();
-  // Compute live current value to append as latest point
-  let liveV = null;
-  try {
-    const pos = getPositions();
-    const T = getTotals(pos);
-    if(T && T.totalValue != null && !isNaN(T.totalValue) && T.totalValue > 0) liveV = T.totalValue;
-  } catch(e){}
-  const appendLive = (arr) => {
-    if(liveV == null || !arr.length) return arr;
-    const last = arr[arr.length-1];
-    // Skip if last snapshot is very recent (< 5 min) AND values are close
-    const lastT = new Date(last.t);
-    const ageSec = (now - lastT) / 1000;
-    if(ageSec < 60 && Math.abs(last.v - liveV) / last.v < 0.001) return arr;
-    return [...arr, { t: now.toISOString(), v: liveV }];
-  };
+  // No live appending - show only real snapshots
   if (range==='1d') {
     const allDates = [...new Set(h.map(p=>p.t.slice(0,10)))].sort();
     const lastDate = allDates[allDates.length-1];
-    return appendLive(h.filter(p=>p.t.slice(0,10)===lastDate).sort((a,b)=>a.t.localeCompare(b.t)));
+    return h.filter(p=>p.t.slice(0,10)===lastDate).sort((a,b)=>a.t.localeCompare(b.t));
   }
   // For "all": anchor to first transaction date with synthetic invested-value point
   if (range==='all') {
@@ -5580,16 +5579,30 @@ function dFilterHistory(range) {
           if(costByDate[dayStr] != null) lastCost = costByDate[dayStr];
           synthetic.push({t: dayStr + 'T12:00:00', v: lastCost});
         }
-        return appendLive([...synthetic, ...sortedH]);
+        // Add 7 zero points before first tx
+        const zeroPoints = [];
+        for(let d=7; d>=1; d--){
+          const zd = new Date(firstTxDate);
+          zd.setDate(zd.getDate() - d);
+          zeroPoints.push({t: zd.toISOString().slice(0,10)+'T12:00:00', v: 0});
+        }
+        return [...zeroPoints, ...synthetic, ...sortedH];
       }
     }
-    return appendLive(sortedH);
+    // Even without synthetic: add 7 zero points before first history point
+    const zeroPoints2 = [];
+    for(let d=7; d>=1; d--){
+      const zd2 = new Date(sortedH[0].t);
+      zd2.setDate(zd2.getDate() - d);
+      zeroPoints2.push({t: zd2.toISOString().slice(0,10)+'T12:00:00', v: 0});
+    }
+    return [...zeroPoints2, ...sortedH];
   }
   const cutoff = {
     '1w': new Date(now-7*24*60*60*1000),
     '1m': new Date(now-30*24*60*60*1000),
   }[range] || new Date(0);
-  return appendLive(h.filter(p=>new Date(p.t)>=cutoff).sort((a,b)=>a.t.localeCompare(b.t)));
+  return h.filter(p=>new Date(p.t)>=cutoff).sort((a,b)=>a.t.localeCompare(b.t));
 }
 
 // ── Chart ─────────────────────────────────────────────────────────────────────
@@ -6107,12 +6120,16 @@ function Dashboard() {
       try{
         const r = await fetch('/api/data',{credentials:'include',headers:_authHeaders()});
         const d = await r.json();
-        if(d.history && d.history.length > (S.history||[]).length){
+        if(d.history){
+          // Always update — server may have replaced or added points
           S.history = d.history;
+          // Also update prices and other data
+          if(d.prices) S.prices = d.prices;
+          if(d.dayChangePcts) S.dayChangePcts = d.dayChangePcts;
           setTick(t=>t+1);
         }
       }catch(e){}
-    }, 5 * 60 * 1000);
+    }, 60 * 1000);  // every 1 minute
 
     return ()=>{
       delete window._dashboardForceUpdate;
@@ -6121,8 +6138,8 @@ function Dashboard() {
   },[]);
 
   const built = useMemo(()=>dBuildHoldings(), [S.prices, S.tickers, S.txns, activeCurrency, euruah, eurUsdRate]);
-  const history = useMemo(()=>dFilterHistory(range), [range, S.history]);
-  const dayCh = useMemo(()=>dDayChange(), [S.history, activeCurrency]);
+  const history = useMemo(()=>dFilterHistory(range), [range, S.history, S.prices, S.txns, activeCurrency, euruah, eurUsdRate]);
+  const dayCh = useMemo(()=>dDayChange(), [S.history, S.prices, S.txns, activeCurrency, euruah, eurUsdRate]);
   // lang in key forces full re-render of children when language changes
   const langKey = lang;
 
