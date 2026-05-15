@@ -925,14 +925,15 @@ def seed_history_from_yahoo(user_id: str):
     for h in ticker_history.values():
         all_ts.update(h.keys())
 
-    # Implementation of 7-day zero-lead-in
+    # Implementation of 30-day zero-lead-in
     first_dt = datetime.fromisoformat(first_tx_date.split('T')[0])
-    lead_in_start = (first_dt - timedelta(days=7)).strftime("%Y-%m-%d")
-    for i in range(8):
-        d = (first_dt - timedelta(days=7-i)).strftime("%Y-%m-%d")
+    lead_in_start_dt = first_dt - timedelta(days=30)
+    lead_in_start = lead_in_start_dt.strftime("%Y-%m-%d")
+    for i in range(31):
+        d = (first_dt - timedelta(days=30-i)).strftime("%Y-%m-%d")
         all_ts.add(d + "T00:00")
 
-    sorted_ts = sorted(list(all_ts))
+    sorted_ts = sorted([ts for ts in all_ts if ts[:10] >= lead_in_start])
 
     # Fill in gaps in ticker history (forward fill) to avoid dips
     filled_ticker_history = {}

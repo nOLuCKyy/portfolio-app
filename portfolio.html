@@ -1492,9 +1492,10 @@ function calcTtwror(){
   if(periodsUsed < 2) return null;
 
   // Annualize
-  const firstDay = sortedDays[0];
+  // Use the day of the first transaction (non-zero value) as start to avoid diluting return with zero-period
+  const firstActiveDay = sortedDays.find(d => dayVal[d] > 0) || sortedDays[0];
   const lastDay  = sortedDays[sortedDays.length-1];
-  const days = (new Date(lastDay) - new Date(firstDay)) / (1000*60*60*24);
+  const days = (new Date(lastDay) - new Date(firstActiveDay)) / (1000*60*60*24);
   if(days < 7) return (product - 1) * 100;
   const annualized = (Math.pow(product, 365/days) - 1) * 100;
   if(!isFinite(annualized) || Math.abs(annualized) > 1000) return null;
@@ -1894,13 +1895,15 @@ function filterHistory(range){
   const now=new Date();
 
   // Пункт 6: знайти найстарішу транзакцію
-  let firstTxDate = new Date(0);
+  let firstTxDate = null;
   for(const t of S.tickers){
     for(const tx of (S.txns[t.id]||[])){
+      if(!tx.date) continue;
       const d = new Date(tx.date);
       if(!firstTxDate || d < firstTxDate) firstTxDate = d;
     }
   }
+  if(!firstTxDate) firstTxDate = new Date(now - 30*24*3600*1000);
 
   let cutoff;
   if(range === "1d"){
