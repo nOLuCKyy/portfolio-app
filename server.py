@@ -537,21 +537,20 @@ def fetch_yahoo(symbol):
                 "dayChangePct": round(chg,2) if chg else None}
     except Exception as e:
         return {"error": str(e)[:60]}
-
-def get_eurusd():
-    r = fetch_yahoo("EURUSD=X")
-    return r["price"] if "price" in r else 0.925
-
 def get_gbpeur():
     r = fetch_yahoo("GBPEUR=X")
     return r["price"] if "price" in r else 1.15
 
-def to_eur(price, currency, eurusd):
+
+def get_eurusd():
+    r = fetch_yahoo("EURUSD=X")
+    return r["price"] if "price" in r else 0.925
+def to_eur(price, currency, eurusd, gbpeur=1.20):
     if price is None: return None
     c = currency.upper() if currency else "USD"
     if c == "EUR": return price
-    if c in ("GBP",): return price * 1.175
-    if c in ("GBp","GBX","PENCE"): return (price/100) * 1.175
+    if c in ("GBP",): return price * gbpeur
+    if c in ("GBp","GBX","PENCE"): return (price/100) * gbpeur
     return price / eurusd
 
 YAHOO_MAP = {
@@ -586,17 +585,18 @@ def fetch_market():
         if _market_cache["data"] and (time.time() - _market_cache["ts"]) < 60:
             return _market_cache["data"]
     eurusd = get_eurusd()
+    gbpeur = get_gbpeur()
     result = {}
     lock2  = threading.Lock()
 
-    def fetch_one(item):
+    def fetch_one(item, _eurusd=eurusd, _gbpeur=gbpeur):
         key, sym, label = item
         r = fetch_yahoo(sym)
         if "error" in r: return
         price = r["price"]; prev = r.get("prev") or price; cur = r["currency"]
         is_rate = key in ("USDUAH","EURUAH","EURUSD","GBPEUR")
-        dp  = price if is_rate else to_eur(price, cur, eurusd)
-        dpr = prev  if is_rate else to_eur(prev,  cur, eurusd)
+        dp  = price if is_rate else to_eur(price, cur, _eurusd, _gbpeur)
+        dpr = prev  if is_rate else to_eur(prev,  cur, _eurusd, _gbpeur)
         chg = ((dp-dpr)/dpr*100) if dpr else 0
         with lock2:
             result[key] = {"label":label,"price":round(dp,4),"change_pct":round(chg,2),"is_rate":is_rate}
@@ -624,7 +624,8 @@ def calc_portfolio_value_db(user_id: str) -> float:
     tickers = db_all("SELECT id, symbol, yahoo_symbol FROM tickers WHERE user_id=?", (user_id,))
     total = 0.0
     for t in tickers:
-        sym = t["yahoo_symbol"] or t["symbol"]
+        # Use consistent symbol resolution
+        sym = YAHOO_MAP.get(t["symbol"].upper(), t["yahoo_symbol"] or t["symbol"])
         price_row = db_one("SELECT price FROM prices_cache WHERE symbol=?", (sym,))
         if not price_row or not price_row["price"]: continue
         price = price_row["price"]
@@ -655,7 +656,7 @@ def do_snapshot(user_id: str):
     if not tickers: return
     loaded = sum(1 for t in tickers if db_one(
         "SELECT 1 FROM prices_cache WHERE symbol=? AND price IS NOT NULL",
-        (t["yahoo_symbol"] or t["symbol"],)
+        (YAHOO_MAP.get(t["symbol"].upper(), t["yahoo_symbol"] or t["symbol"]),)
     ))
     if loaded < max(1, len(tickers) * 0.7):
         return
@@ -698,7 +699,7 @@ def do_day_start(user_id: str, force=False):
     tickers = db_all("SELECT id, yahoo_symbol, symbol FROM tickers WHERE user_id=?", (user_id,))
     prices = {}
     for t in tickers:
-        sym = t["yahoo_symbol"] or t["symbol"]
+        sym = YAHOO_MAP.get(t["symbol"].upper(), t["yahoo_symbol"] or t["symbol"])
         row = db_one("SELECT price FROM prices_cache WHERE symbol=?", (sym,))
         if row and row["price"]: prices[str(t["id"])] = row["price"]
     if not prices: return
@@ -732,18 +733,19 @@ def refresh_prices(user_id: str):
     tickers = db_all("SELECT id, symbol, yahoo_symbol FROM tickers WHERE user_id=?", (user_id,))
     if not tickers: return
     eurusd = get_eurusd()
+    gbpeur = get_gbpeur()
     lock   = threading.Lock()
     errors = [0]
 
     def fetch_one(t):
-        sym = t["yahoo_symbol"] or t["symbol"]
+        sym = YAHOO_MAP.get(t["symbol"].upper(), t["yahoo_symbol"] or t["symbol"])
         r   = fetch_yahoo(sym)
         if "error" in r:
             with lock: errors[0] += 1
             return
         cur   = r["currency"]
-        price = round(to_eur(r["price"], cur, eurusd), 4)
-        prev  = round(to_eur(r["prev"],  cur, eurusd), 4) if r.get("prev") else None
+        price = round(to_eur(r["price"], cur, eurusd, gbpeur), 4)
+        prev  = round(to_eur(r["prev"], cur, eurusd, gbpeur), 4) if r.get("prev") else None
         day_p = r.get("dayChangePct")
         if day_p is None and prev and prev > 0:
             day_p = round((price - prev) / prev * 100, 2)
@@ -803,7 +805,7 @@ def update_analyst_targets(user_id: str):
     eu_sfx = (".DE",".DU",".MU",".F",".SG",".AS",".MI")
     changed = 0
     for t in tickers:
-        ysym = t["yahoo_symbol"] or t["symbol"]
+        ysym = YAHOO_MAP.get(t["symbol"].upper(), t["yahoo_symbol"] or t["symbol"])
         base = ysym.split(".")[0].upper()
         us = EU_TO_US.get(base) or (ysym if not any(ysym.upper().endswith(s) for s in eu_sfx) else None)
         if not us: continue
@@ -811,7 +813,8 @@ def update_analyst_targets(user_id: str):
             info = _yf.Ticker(us).info or {}
             tp = info.get("targetMeanPrice")
             if tp and not _math.isnan(float(tp)):
-                price_eur = round(float(tp) / 100 * 1.175, 2) if us.endswith(".L") else round(float(tp) / eurusd, 2)
+                gbpeur = get_gbpeur()
+                price_eur = round(float(tp) / 100 * gbpeur, 2) if us.endswith(".L") else round(float(tp) / eurusd, 2)
                 db_exec(
                     "INSERT OR REPLACE INTO price_targets(user_id,ticker_id,price_eur,updated_at) VALUES(?,?,?,datetime('now'))",
                     (user_id, t["id"], price_eur)
@@ -822,33 +825,30 @@ def update_analyst_targets(user_id: str):
         print(f"  [targets] {user_id}: updated {changed} analyst targets")
 
 def seed_history_from_yahoo(user_id: str):
-    """Build 3-month portfolio history and store in price_history table."""
+    """Build transaction-aware 3-month portfolio history and store in price_history."""
     tickers = db_all("SELECT id, symbol, yahoo_symbol, type FROM tickers WHERE user_id=?", (user_id,))
     if not tickers: return {"error": "no tickers"}
 
+    all_tx = db_all("SELECT ticker_id, type, shares, date FROM transactions WHERE user_id=? ORDER BY date", (user_id,))
+    tx_by_ticker = {}
+    for tx in all_tx:
+        tid = tx["ticker_id"]
+        if tid not in tx_by_ticker: tx_by_ticker[tid] = []
+        tx_by_ticker[tid].append(tx)
+
     eurusd = get_eurusd()
-    CRYPTO = ("-USD","-EUR","-BTC","-ETH")
-    positions = []
+    gbpeur = get_gbpeur()
+
+    ticker_history = {} # ticker_id -> { date: price_eur }
+    failed_tickers = []
+
     for t in tickers:
-        ysym = t["yahoo_symbol"] or t["symbol"]
-        if any(ysym.upper().endswith(s) for s in CRYPTO): continue
-        tx_rows = db_all("SELECT type,shares,price FROM transactions WHERE ticker_id=? ORDER BY date", (t["id"],))
-        shares = 0.0; cost = 0.0
-        for tx in tx_rows:
-            if tx["type"] == "buy": cost += tx["shares"]*tx["price"]; shares += tx["shares"]
-            elif shares > 0:
-                avg = cost/shares; s = min(tx["shares"],shares); cost -= s*avg; shares -= s
-        if max(0.0, shares) > 0:
-            positions.append({"sym": ysym, "shares": max(0.0, shares)})
+        sym = t["symbol"].upper()
+        ysym = YAHOO_MAP.get(sym, t["yahoo_symbol"] or t["symbol"])
 
-    if not positions: return {"error": "no positions"}
-
-    from datetime import date as _date, timedelta as _td
-    daily_val = {}; daily_count = {}
-
-    for pos in positions:
         url = (f"https://query1.finance.yahoo.com/v8/finance/chart/"
-               f"{urllib.parse.quote(pos['sym'])}?interval=1d&range=3mo")
+               f"{urllib.parse.quote(ysym)}?interval=1d&range=1y")
+        success = False
         try:
             req = urllib.request.Request(url, headers=YAHOO_HEADERS)
             with urllib.request.urlopen(req, timeout=15) as r:
@@ -857,47 +857,96 @@ def seed_history_from_yahoo(user_id: str):
             tss    = res.get("timestamp") or []
             closes = res["indicators"]["quote"][0]["close"]
             cur    = res["meta"].get("currency","USD").upper()
+
+            h = {}
             for ts, c in zip(tss, closes):
                 if c is None: continue
                 d = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
-                if _date.fromisoformat(d).weekday() >= 5: continue
-                p = to_eur(c, cur, eurusd) or 0
-                daily_val[d]   = daily_val.get(d, 0.0) + pos["shares"] * p
-                daily_count[d] = daily_count.get(d, 0) + 1
+                p = to_eur(c, cur, eurusd, gbpeur) or 0
+                h[d] = p
+            if h:
+                ticker_history[t["id"]] = h
+                success = True
+                print(f"  [seed] {sym} ({ysym}): {len(h)} days OK")
         except Exception as e:
-            print(f"  [seed] {pos['sym']}: {e}")
+            print(f"  [seed] {sym} ({ysym}) ERROR: {e}")
 
-    if not daily_val: return {"error": "no data"}
+        if not success:
+            # Fallback: use current price from prices_cache for all dates
+            failed_tickers.append((sym, ysym))
+            cur_price_row = db_one("SELECT price FROM prices_cache WHERE symbol=?", (ysym,))
+            if cur_price_row and cur_price_row["price"]:
+                # Apply current price to all dates as fallback (better than nothing)
+                cur_p = cur_price_row["price"]
+                # Get list of all dates from any other ticker for reference
+                ref_dates = set()
+                for h_other in ticker_history.values():
+                    ref_dates.update(h_other.keys())
+                if ref_dates:
+                    h_fb = {d: cur_p for d in ref_dates}
+                    ticker_history[t["id"]] = h_fb
+                    print(f"  [seed] {sym}: fallback to current price €{cur_p} for {len(h_fb)} days")
 
-    threshold = max(1, len(positions) * 0.5)
-    good = {d: v for d, v in daily_val.items()
-            if daily_count.get(d, 0) >= threshold and v > 0}
-    if not good: good = dict(daily_val)
+    if failed_tickers:
+        print(f"  [seed] FAILED tickers (using fallback): {failed_tickers}")
 
-    import random; random.seed(42)
-    sorted_days = sorted(good.items())
+    if not ticker_history: return {"error": "no data fetched"}
+
+    all_dates = set()
+    for h in ticker_history.values():
+        all_dates.update(h.keys())
+    sorted_dates = sorted(list(all_dates))
+
+    ticker_history_filled = {}
+    for tid, h in ticker_history.items():
+        filled = {}
+        last_p = None
+        for d in sorted_dates:
+            if d in h: last_p = h[d]
+            if last_p is not None: filled[d] = last_p
+        ticker_history_filled[tid] = filled
+
+    from datetime import datetime as _dt, timezone as _tz
+    now_utc = _dt.now(_tz.utc)
+    today_str = now_utc.strftime("%Y-%m-%d")
     history = []
-    for i, (date_str, close_val) in enumerate(sorted_days):
-        prev_close = sorted_days[i-1][1] if i > 0 else close_val
-        hours = list(range(9, 18))
-        n = len(hours)
-        for j, hour in enumerate(hours):
-            t_ratio = j / (n - 1)
-            base = prev_close + (close_val - prev_close) * t_ratio
-            noise = (random.random() - 0.5) * 0.003 * base
-            history.append({"t": f"{date_str}T{hour:02d}:00", "v": round(base + noise, 2)})
-        history[-1]["v"] = round(close_val, 2)
 
-    # Save to DB
+    # ONE accurate point per day: real Yahoo close * shares held at end of day
+    for date_str in sorted_dates:
+        # Skip today — let live snapshots handle it
+        if date_str >= today_str: continue
+
+        d_val = 0.0
+        for tid, prices in ticker_history_filled.items():
+            shares = 0.0
+            for tx in tx_by_ticker.get(tid, []):
+                if tx["date"][:10] <= date_str:
+                    if tx["type"] == "buy": shares += tx["shares"]
+                    else: shares -= tx["shares"]
+                else: break
+            p = prices.get(date_str)
+            if p and shares > 0:
+                d_val += shares * p
+
+        if d_val <= 0: continue
+
+        # Single accurate point per day at market close time (17:00)
+        history.append({"t": f"{date_str}T17:00", "v": round(d_val, 2)})
+
+    if not history: return {"error": "no history generated"}
+
     conn = get_db()
-    conn.execute("DELETE FROM price_history WHERE user_id=?", (user_id,))
-    for h in history:
+    today_str = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+    # Delete all history EXCEPT today's snapshots (they are real and live)
+    conn.execute("DELETE FROM price_history WHERE user_id=? AND timestamp NOT LIKE ?",
+                 (user_id, today_str + "%"))
+    # Insert new accurate seed points (excludes today by design)
+    for h_point in history:
         conn.execute("INSERT OR REPLACE INTO price_history(user_id,timestamp,value_eur) VALUES(?,?,?)",
-                     (user_id, h["t"], h["v"]))
+                     (user_id, h_point["t"], h_point["v"]))
     conn.commit()
+    print(f"  [seed] rebuilt history: {len(history)} accurate daily points + today's live snapshots")
     return {"history": history, "points": len(history)}
-
-
 def resolve_yahoo_symbol(symbol):
     """Try symbol as-is first, then with exchange fallbacks for bare symbols."""
     if not symbol: return symbol
@@ -1044,11 +1093,6 @@ def is_market_open(symbol=""):
 
 
 
-def get_gbpeur():
-    r = fetch_yahoo("GBPEUR=X")
-    return r["price"] if "price" in r else 1.15
-
-
 
 # ── Market cache refresh ──────────────────────────────────────────────────────
 def _refresh_market_cache(symbols: list, force_period: bool = False):
@@ -1059,6 +1103,7 @@ def _refresh_market_cache(symbols: list, force_period: bool = False):
     try:
         from datetime import date as _date, timedelta as _td, timezone as _tz
         eurusd = get_eurusd()
+        gbpeur = get_gbpeur()
         update_prices_cache("EURUSD=X", eurusd, None, None)
         def fetch_one(sym):
             if not sym: return
@@ -1067,8 +1112,8 @@ def _refresh_market_cache(symbols: list, force_period: bool = False):
             if fresh and not force_period:
                 r = fetch_yahoo(sym)
                 if "error" not in r:
-                    cur = r["currency"]; price_eur = round(to_eur(r["price"],cur,eurusd),2)
-                    prev_eur = round(to_eur(r["prev"],cur,eurusd),2) if r.get("prev") else None
+                    cur = r["currency"]; price_eur = round(to_eur(r["price"],cur,eurusd, gbpeur),2)
+                    prev_eur = round(to_eur(r["prev"],cur,eurusd, gbpeur),2) if r.get("prev") else None
                     day_pct = r.get("dayChangePct")
                     if day_pct is None and prev_eur and prev_eur > 0:
                         day_pct = round((price_eur-prev_eur)/prev_eur*100,2)
@@ -1091,9 +1136,9 @@ def _refresh_market_cache(symbols: list, force_period: bool = False):
                     return None
                 def pct(a,b): return round((a-b)/b*100,2) if a and b else None
                 m1 = pct(raw,cc(today-_td(days=30))); ytd = pct(raw,cc(_date(today.year-1,12,31))); y1 = pct(raw,cc(today-_td(days=365)))
-                price_eur = round(to_eur(raw,cur,eurusd),2)
+                price_eur = round(to_eur(raw,cur,eurusd, gbpeur),2)
                 prev_raw = meta.get("previousClose") or meta.get("chartPreviousClose")
-                prev_eur = round(to_eur(prev_raw,cur,eurusd),2) if prev_raw else None
+                prev_eur = round(to_eur(prev_raw,cur,eurusd, gbpeur),2) if prev_raw else None
                 dp_raw = meta.get("regularMarketChangePercent"); day_pct = round(dp_raw,2) if dp_raw else None
                 if day_pct is None and prev_eur and prev_eur > 0: day_pct = round((price_eur-prev_eur)/prev_eur*100,2)
                 update_prices_cache(sym,price_eur,prev_eur,day_pct,m1_pct=m1,ytd_pct=ytd,y1_pct=y1)
@@ -1195,7 +1240,7 @@ def calc_rebalance_for_user(user_id, params):
     if not tickers: return {"rows":[],"totalToBuy":0,"totalToSell":0,"newTotal":0}
     prices = {}
     for t in tickers:
-        sym = t["yahoo_symbol"] or t["symbol"]
+        sym = YAHOO_MAP.get(t["symbol"].upper(), t["yahoo_symbol"] or t["symbol"])
         row = db_one("SELECT price FROM prices_cache WHERE symbol=?",(sym,))
         if row and row["price"]: prices[t["id"]] = row["price"]
     target_rows = db_all("SELECT ticker_id,target_pct FROM portfolio_targets WHERE user_id=?",(user_id,))
@@ -1372,15 +1417,15 @@ class Handler(BaseHTTPRequestHandler):
             tlist = json.loads(raw); eurusd = get_eurusd()
             res = {"eurusd": round(eurusd,4), "prices": {}}
             lock = threading.Lock()
-            _g=globals(); _to_eur=_g["to_eur"]; _eurusd=eurusd
-            def fetch_one(t, _to_eur=_to_eur, _eurusd=_eurusd):
-                s = t.get("yahooSymbol") or t.get("symbol")
+            _eurusd=eurusd; _gbpeur=get_gbpeur()
+            def fetch_one(t):
+                s = YAHOO_MAP.get(t.get("symbol","").upper(), t.get("yahooSymbol") or t.get("symbol"))
                 r = fetch_yahoo(s)
                 if "error" in r:
                     with lock: res["prices"][str(t["id"])] = r; return
                 cur   = r["currency"]
-                price = round(_to_eur(r["price"], cur, _eurusd), 4)
-                prev  = round(_to_eur(r["prev"],  cur, _eurusd), 4) if r.get("prev") else None
+                price = round(to_eur(r["price"], cur, _eurusd, _gbpeur), 4)
+                prev  = round(to_eur(r["prev"],  cur, _eurusd, _gbpeur), 4) if r.get("prev") else None
                 dp    = r.get("dayChangePct")
                 if dp is None and prev and prev > 0:
                     dp = round((price-prev)/prev*100, 2)
@@ -1397,9 +1442,10 @@ class Handler(BaseHTTPRequestHandler):
             sym = params.get("symbol",[""])[0]
             if not sym: self.send_json({"error":"missing"},400); return
             eurusd = get_eurusd()
+            gbpeur = get_gbpeur()
             r = fetch_yahoo(YAHOO_MAP.get(sym.upper(), sym))
             if "error" in r: self.send_json(r); return
-            price = round(to_eur(r["price"], r["currency"], eurusd), 4)
+            price = round(to_eur(r["price"], r["currency"], eurusd, gbpeur), 4)
             self.send_json({"price": price, "currency":"EUR",
                            "dayChangePct": r.get("dayChangePct"),
                            "eurusd": round(eurusd,4)}); return
@@ -1451,6 +1497,7 @@ class Handler(BaseHTTPRequestHandler):
             if not raw: self.send_json({"error":"missing"},400); return
             ticker_list = json.loads(raw)
             eurusd = get_eurusd()
+            gbpeur = get_gbpeur()
             results = {}; lock = threading.Lock()
             from datetime import date as _date, timedelta as _td, timezone as _tz
 
@@ -1471,7 +1518,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not current_raw:
                         with lock: results[yahoo_sym] = {"error":"no price"}; return
 
-                    def t2e(p): return to_eur(p, cur, eurusd) if p else None
+                    def t2e(p): return to_eur(p, cur, eurusd, gbpeur) if p else None
                     date_close = {}
                     for ts, c in zip(tss, closes):
                         if c: date_close[datetime.fromtimestamp(ts,_tz.utc).strftime("%Y-%m-%d")] = c
@@ -1565,28 +1612,7 @@ class Handler(BaseHTTPRequestHandler):
                     except: pass
 
             # ── Fetch chart data (5y daily + 2d intraday) ────────────────────
-            def to_eur(p, currency=None):
-                c = (currency or "USD").upper()
-                if p is None: return None
-                if c == "EUR": return p
-                if c in ("GBp","GBX","PENCE"): return (p/100)*1.175
-                if c == "GBP": return p*1.175
-                return p/eurusd
-
             gbpeur = get_gbpeur()
-
-            def tp_to_eur(tp, us_sym):
-                """Convert target price considering the US symbol's currency."""
-                if tp is None: return None
-                tp = float(tp)
-                if us_sym and us_sym.endswith(".L"):
-                    # yfinance returns targetMeanPrice in GBp (pence) for LSE stocks
-                    # e.g. BP.L target ~570 GBp = £5.70 * gbpeur = ~€6.56
-                    result_gbp = tp / 100  # GBp to GBP
-                    result_eur = result_gbp * gbpeur
-
-                    return round(result_eur, 2)
-                return round(tp / eurusd, 2)
 
             try:
                 url = (f"https://query1.finance.yahoo.com/v8/finance/chart/"
@@ -1606,7 +1632,7 @@ class Handler(BaseHTTPRequestHandler):
                 for ts, c in zip(timestamps, closes):
                     if c is None: continue
                     dt_s = _dt.fromtimestamp(ts, _tz.utc).strftime("%Y-%m-%dT%H:%M")
-                    history.append({"t": dt_s, "v": round(to_eur(c, cur), 4)})
+                    history.append({"t": dt_s, "v": round(to_eur(c, cur, eurusd, gbpeur), 4)})
 
                 # Intraday 5m for last 5 days (includes premarket + afterhours)
                 # Use US symbol if available to get full pre/afterhours coverage
@@ -1629,7 +1655,7 @@ class Handler(BaseHTTPRequestHandler):
                     for ts2, c2 in zip(tss_i, cls_i):
                         if c2 is None: continue
                         dt_s = _dt.fromtimestamp(ts2, _tz.utc).strftime("%Y-%m-%dT%H:%M")
-                        intraday.append({"t": dt_s, "v": round(to_eur(c2, intraday_cur), 4)})
+                        intraday.append({"t": dt_s, "v": round(to_eur(c2, intraday_cur, eurusd, gbpeur), 4)})
                     if intraday:
                         first_intra_date = intraday[0]["t"][:10]
                         # Keep daily history intact, store intraday separately
@@ -1647,7 +1673,7 @@ class Handler(BaseHTTPRequestHandler):
                         if d in date_close: return date_close[d]
                     return None
 
-                current_eur = to_eur(current_raw, cur)
+                current_eur = to_eur(current_raw, cur, eurusd, gbpeur)
                 day_pct_raw = meta.get("regularMarketChangePercent") or meta.get("regularMarketChange")
                 if day_pct_raw is not None and current_raw and current_raw > 0:
                     # regularMarketChange is absolute change, convert to pct if needed
@@ -1672,8 +1698,8 @@ class Handler(BaseHTTPRequestHandler):
                     "m1Pct":  pct(current_eur, m1_c),
                     "ytdPct": pct(current_eur, ytd_c),
                     "y1Pct":  pct(current_eur, y1_c),
-                    "high52": round(to_eur(meta.get("fiftyTwoWeekHigh"), cur), 2) if meta.get("fiftyTwoWeekHigh") else None,
-                    "low52":  round(to_eur(meta.get("fiftyTwoWeekLow"),  cur), 2) if meta.get("fiftyTwoWeekLow")  else None,
+                    "high52": round(to_eur(meta.get("fiftyTwoWeekHigh"), cur, eurusd, gbpeur), 2) if meta.get("fiftyTwoWeekHigh") else None,
+                    "low52":  round(to_eur(meta.get("fiftyTwoWeekLow"),  cur, eurusd, gbpeur), 2) if meta.get("fiftyTwoWeekLow")  else None,
                     "volume": meta.get("regularMarketVolume"),
                     "history": history[-3000:],
                     "historyDaily": h_daily[-2000:],
@@ -1773,7 +1799,7 @@ class Handler(BaseHTTPRequestHandler):
                             "website":       ap.get("website",""),
                             "employees":     rv(ap,"fullTimeEmployees"),
                             "description":   desc,
-                            "targetPrice":   eur_v(rv(fd,"targetMeanPrice")),
+                            "targetPrice":   round(to_eur(rv(fd,"targetMeanPrice"), "USD" if not (us_sym and us_sym.endswith(".L")) else "GBP", eurusd, gbpeur), 2) if rv(fd, "targetMeanPrice") else None,
                             "analyst":       analyst,
                             "totalAnalysts": total,
                             "revenues":      revenues,
@@ -1858,7 +1884,7 @@ class Handler(BaseHTTPRequestHandler):
                         "website":      info.get("website",""),
                         "employees":    info.get("fullTimeEmployees"),
                         "description":  (info.get("longBusinessSummary","") or "")[:600],
-                        "targetPrice":  tp_to_eur(tp_raw, us_sym),
+                        "targetPrice":  round(to_eur(tp_raw, "USD" if not (us_sym and us_sym.endswith(".L")) else "GBP", eurusd, gbpeur), 2) if tp_raw else None,
                         "analyst":      analyst_yf,
                         "totalAnalysts":info.get("numberOfAnalystOpinions",0) or 0,
                         "revenues":     revenues,
@@ -2092,7 +2118,7 @@ if __name__ == "__main__":
         all_syms = set()
         for row in db_all("SELECT id FROM users"):
             for t in db_all("SELECT yahoo_symbol,symbol FROM tickers WHERE user_id=?",(row["id"],)):
-                all_syms.add(t["yahoo_symbol"] or t["symbol"])
+                all_syms.add(YAHOO_MAP.get(t["symbol"].upper(), t["yahoo_symbol"] or t["symbol"]))
         if all_syms:
             _update_period_pcts_for_symbols(list(all_syms))
             print(f"  [startup] period pcts refreshed ({len(all_syms)} symbols)")
