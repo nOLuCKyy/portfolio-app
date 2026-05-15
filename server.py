@@ -835,9 +835,9 @@ def seed_history_from_yahoo(user_id: str):
         if tid not in tx_by_ticker: tx_by_ticker[tid] = []
         tx_by_ticker[tid].append(tx)
 
-    # 1. Fetch historical FX rates for last 3 months
-    def fetch_hist_fx(symbol):
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}?interval=1d&range=3mo"
+    # 1. Fetch historical FX rates for last 2 years
+    def fetch_hist_fx(symbol, range_str="2y"):
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}?interval=1d&range={range_str}"
         try:
             req = urllib.request.Request(url, headers=YAHOO_HEADERS)
             with urllib.request.urlopen(req, timeout=10) as r:
@@ -862,44 +862,76 @@ def seed_history_from_yahoo(user_id: str):
 
     ticker_history = {} # ticker_id -> { timestamp: price_eur }
 
+    # Determine the first transaction date
+    first_tx_date = "9999-99-99"
+    for tx_list in tx_by_ticker.values():
+        for tx in tx_list:
+            if tx["date"] < first_tx_date: first_tx_date = tx["date"]
+
+    if first_tx_date == "9999-99-99": return {"error": "no transactions found"}
+
     for t in tickers:
         sym = t["symbol"].upper()
         ysym = YAHOO_MAP.get(sym, t["yahoo_symbol"] or t["symbol"])
+        h = {}
 
-        # Fetch hourly data for 3 months
-        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/"
-               f"{urllib.parse.quote(ysym)}?interval=1h&range=3mo")
+        # Fetch daily data for 2 years to get the historical trend
         try:
-            req = urllib.request.Request(url, headers=YAHOO_HEADERS)
-            with urllib.request.urlopen(req, timeout=15) as r:
-                j = json.loads(r.read().decode())
-            res    = j["chart"]["result"][0]
-            tss    = res.get("timestamp") or []
-            closes = res["indicators"]["quote"][0]["close"]
-            cur    = res["meta"].get("currency","USD").upper()
-
-            h = {}
-            for ts, c in zip(tss, closes):
+            url_d = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(ysym)}?interval=1d&range=2y"
+            req_d = urllib.request.Request(url_d, headers=YAHOO_HEADERS)
+            with urllib.request.urlopen(req_d, timeout=15) as r:
+                j_d = json.loads(r.read().decode())
+            res_d = j_d["chart"]["result"][0]
+            cur_d = res_d["meta"].get("currency","USD").upper()
+            tss_d = res_d.get("timestamp") or []
+            cls_d = res_d["indicators"]["quote"][0]["close"]
+            for ts, c in zip(tss_d, cls_d):
                 if c is None: continue
-                # ISO format including hour
+                dt = datetime.fromtimestamp(ts, timezone.utc)
+                d_str = dt.strftime("%Y-%m-%d")
+                ts_str = d_str + "T12:00" # Use mid-day for daily points
+                fx_usd = hist_eurusd.get(d_str, cur_eurusd)
+                fx_gbp = hist_gbpeur.get(d_str, cur_gbpeur)
+                h[ts_str] = to_eur(c, cur_d, fx_usd, fx_gbp) or 0
+        except Exception as e:
+            print(f"  [seed-daily] {ysym}: {e}")
+
+        # Fetch hourly data for 3 months for precision
+        try:
+            url_h = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(ysym)}?interval=1h&range=3mo"
+            req_h = urllib.request.Request(url_h, headers=YAHOO_HEADERS)
+            with urllib.request.urlopen(req_h, timeout=15) as r:
+                j_h = json.loads(r.read().decode())
+            res_h = j_h["chart"]["result"][0]
+            cur_h = res_h["meta"].get("currency","USD").upper()
+            tss_h = res_h.get("timestamp") or []
+            cls_h = res_h["indicators"]["quote"][0]["close"]
+            for ts, c in zip(tss_h, cls_h):
+                if c is None: continue
                 dt = datetime.fromtimestamp(ts, timezone.utc)
                 ts_str = dt.strftime("%Y-%m-%dT%H:%M")
                 d_str  = dt.strftime("%Y-%m-%d")
-
-                # Use historical FX for that specific date
                 fx_usd = hist_eurusd.get(d_str, cur_eurusd)
                 fx_gbp = hist_gbpeur.get(d_str, cur_gbpeur)
-                p = to_eur(c, cur, fx_usd, fx_gbp) or 0
-                h[ts_str] = p
-            ticker_history[t["id"]] = h
+                h[ts_str] = to_eur(c, cur_h, fx_usd, fx_gbp) or 0
         except Exception as e:
-            print(f"  [seed] {ysym}: {e}")
+            print(f"  [seed-hourly] {ysym}: {e}")
+
+        ticker_history[t["id"]] = h
 
     if not ticker_history: return {"error": "no data fetched"}
 
     all_ts = set()
     for h in ticker_history.values():
         all_ts.update(h.keys())
+
+    # Implementation of 7-day zero-lead-in
+    first_dt = datetime.fromisoformat(first_tx_date.split('T')[0])
+    lead_in_start = (first_dt - timedelta(days=7)).strftime("%Y-%m-%d")
+    for i in range(8):
+        d = (first_dt - timedelta(days=7-i)).strftime("%Y-%m-%d")
+        all_ts.add(d + "T00:00")
+
     sorted_ts = sorted(list(all_ts))
 
     # Fill in gaps in ticker history (forward fill) to avoid dips
@@ -912,27 +944,29 @@ def seed_history_from_yahoo(user_id: str):
             if last_p is not None: filled[ts] = last_p
         filled_ticker_history[tid] = filled
 
-    # Calculate portfolio value at each hourly timestamp
+    # Calculate portfolio value at each timestamp
     history = []
     for ts_str in sorted_ts:
         v = 0.0
         any_val = False
+        # Normalize comparison: tx["date"] (YYYY-MM-DD) should match ts_str[:10]
+        # or be strictly less than ts_str
         for tid, prices in filled_ticker_history.items():
-            if ts_str not in prices: continue
-
-            # Calculate shares at this specific timestamp
             shares = 0.0
             for tx in tx_by_ticker.get(tid, []):
+                # If transaction date is only YYYY-MM-DD, it becomes 00:00
+                # We want to include it if the timestamp is on or after that day
                 if tx["date"] <= ts_str:
                     if tx["type"] == "buy": shares += tx["shares"]
                     else: shares -= tx["shares"]
                 else: break
 
-            if shares > 0:
+            if shares > 0 and ts_str in prices:
                 v += shares * prices[ts_str]
                 any_val = True
 
-        if any_val and v > 0:
+        # Always add lead-in points (v=0) or calculated points
+        if any_val or ts_str < first_tx_date:
             history.append({"t": ts_str, "v": round(v, 2)})
 
     if not history: return {"error": "no history generated"}

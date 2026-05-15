@@ -1921,7 +1921,19 @@ function filterHistory(range){
       "all": firstTxDate,
     }[range] ?? firstTxDate;
   }
-  return h.filter(p=>new Date(p.t)>=cutoff);
+
+  const filtered = h.filter(p=>new Date(p.t)>=cutoff);
+
+  // Append live total to legacy chart as well
+  try {
+    const pos = getPositions();
+    const T = getTotals(pos);
+    if (T && T.totalValue != null && T.totalValue > 0) {
+        return [...filtered, { t: now.toISOString(), v: T.totalValue }];
+    }
+  } catch(e){}
+
+  return filtered;
 }
 
 function renderChart(){
@@ -1987,12 +1999,12 @@ function renderChart(){
   const margin={top:10,right:16,bottom:24,left:56};
   const iw=W-margin.left-margin.right, ih=H-margin.top-margin.bottom;
 
-  // Лінійна шкала X по індексу — прибирає пусті проміжки
-  const xScale=d3.scaleLinear().domain([0,parsed.length-1]).range([0,iw]);
+  // Time-based scale to fix compression issues
+  const xScale=d3.scaleTime().domain(d3.extent(parsed, d => d.t)).range([0,iw]);
   const yScale=d3.scaleLinear().domain([d3.min(parsed,d=>d.v)*0.998,d3.max(parsed,d=>d.v)*1.002]).range([ih,0]);
 
-  const lineGen=d3.line().x((_,i)=>xScale(i)).y(d=>yScale(d.v)).curve(d3.curveCatmullRom);
-  const areaGen=d3.area().x((_,i)=>xScale(i)).y0(ih).y1(d=>yScale(d.v)).curve(d3.curveCatmullRom);
+  const lineGen=d3.line().x(d=>xScale(d.t)).y(d=>yScale(d.v)).curve(d3.curveCatmullRom);
+  const areaGen=d3.area().x(d=>xScale(d.t)).y0(ih).y1(d=>yScale(d.v)).curve(d3.curveCatmullRom);
 
   const first=parsed[0].v, last=parsed[parsed.length-1].v;
   const accentColor=S.settings.accent||"#7c3aed";
@@ -2014,17 +2026,14 @@ function renderChart(){
   g.append("path").datum(parsed).attr("fill",`url(#${gradId})`).attr("d",areaGen);
   g.append("path").datum(parsed).attr("fill","none").attr("stroke",accentColor).attr("stroke-width",2).attr("d",lineGen);
 
-  // X axis — show dates at evenly spaced points
-  const xTickCount=5;
-  const xTickIndices=Array.from({length:xTickCount},(_,i)=>Math.round(i*(parsed.length-1)/(xTickCount-1)));
+  // X axis — time-aware ticks
   const xAxisG=g.append("g").attr("transform",`translate(0,${ih})`);
-  xTickIndices.forEach(idx=>{
-    const x=xScale(idx);
-    const d=parsed[idx].t;
+  const xTicks = xScale.ticks(5);
+  xTicks.forEach(d => {
     const label=S.chartRange==="1d"?
       `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`:
       `${d.getDate()}.${String(d.getMonth()+1).padStart(2,"0")}`;
-    xAxisG.append("text").attr("x",x).attr("y",14).attr("text-anchor","middle")
+    xAxisG.append("text").attr("x",xScale(d)).attr("y",14).attr("text-anchor","middle")
       .attr("fill","#5a5a72").attr("font-size","10px").text(label);
   });
 
@@ -2064,12 +2073,15 @@ function renderChart(){
   const ttDate=ttBox.append("text").attr("fill","#9090a8").attr("font-size","10px");
   const ttVal =ttBox.append("text").attr("fill",accentColor).attr("font-size","13px").attr("font-weight","700");
 
+  const bisectDate = d3.bisector(d => d.t).left;
   svg.on("mousemove",function(event){
     const[mx]=d3.pointer(event,g.node());
-    // Find closest point by index
-    const idx=Math.max(0,Math.min(parsed.length-1,Math.round(xScale.invert(mx))));
-    const d=parsed[idx];
-    const cx=xScale(idx), cy=yScale(d.v);
+    const x0 = xScale.invert(mx);
+    const i = bisectDate(parsed, x0, 1);
+    const d0 = parsed[i - 1], d1 = parsed[i];
+    const d = (d1 && (x0 - d0.t > d1.t - x0)) ? d1 : d0;
+
+    const cx=xScale(d.t), cy=yScale(d.v);
     const onRight=cx < iw/2;
 
     tooltip.style("display",null);
@@ -5460,15 +5472,23 @@ function dFilterHistory(range) {
     if(T && T.totalValue != null && !isNaN(T.totalValue) && T.totalValue > 0) liveV = T.totalValue;
   } catch(e){}
   const appendLive = (arr) => {
-    if(liveV == null || !arr.length) return arr;
+    if(liveV == null) return arr;
+    if(!arr.length) return [{ t: now.toISOString(), v: liveV }];
+
     const last = arr[arr.length-1];
-    // Skip if last snapshot is from the future (sanity check)
-    if(new Date(last.t) > now) return arr;
-    // Skip if last snapshot is very recent (< 5 min) AND values are close
     const lastT = new Date(last.t);
-    const ageSec = (now - lastT) / 1000;
-    if(ageSec < 60 && Math.abs(last.v - liveV) / last.v < 0.001) return arr;
-    // For 1d chart, if last point is yesterday, we need to ensure the gap doesn't look weird
+
+    // Always force the exact live value at the end if it's the 1d view or within 1 hour of last point
+    const diffHours = (now - lastT) / 3600000;
+    if (diffHours < 1 || range === '1d') {
+        // If the last point is very close in time, replace it to avoid "tail stutter"
+        if ((now - lastT) < 60000) {
+            const newArr = [...arr];
+            newArr[newArr.length-1] = { t: now.toISOString(), v: liveV };
+            return newArr;
+        }
+        return [...arr, { t: now.toISOString(), v: liveV }];
+    }
     return [...arr, { t: now.toISOString(), v: liveV }];
   };
   if (range==='1d') {
@@ -5588,17 +5608,16 @@ function DChart({ history, onHover, lang: compLang }) {
   const yMax = rawMax + yRange * 0.08;
   const yScale = yMax - yMin || 1;
 
-  // X-scale: index-based, so weekends/gaps don't leave empty space
-  const n = pts.length;
-  const xAt = i => padL + (i / (n - 1)) * iw;
+  // X-scale: time-based to show correct proportions
+  const xScaleT = d3.scaleTime().domain(d3.extent(pts, p => new Date(p.t))).range([padL, padL + iw]);
   const yAt = v => padT + ih - ((v - yMin) / yScale) * ih;
 
   // Build line + area paths
-  const linePath = pts.map((p, i) => (i === 0 ? 'M' : 'L') + xAt(i).toFixed(2) + ',' + yAt(p.v).toFixed(2)).join(' ');
-  const areaPath = linePath + ' L' + xAt(n - 1).toFixed(2) + ',' + (padT + ih) + ' L' + padL + ',' + (padT + ih) + ' Z';
+  const linePath = pts.map((p, i) => (i === 0 ? 'M' : 'L') + xScaleT(new Date(p.t)).toFixed(2) + ',' + yAt(p.v).toFixed(2)).join(' ');
+  const areaPath = linePath + ' L' + (padL + iw).toFixed(2) + ',' + (padT + ih) + ' L' + padL + ',' + (padT + ih) + ' Z';
 
   const first = vals[0];
-  const last = vals[n - 1];
+  const last = vals[pts.length - 1];
   const up = last >= first;
   const color = up ? 'var(--up)' : 'var(--down)';
   const gradId = 'dChartGrad_' + (up ? 'up' : 'dn');
@@ -5612,27 +5631,23 @@ function DChart({ history, onHover, lang: compLang }) {
     return sym + v.toFixed(0);
   };
 
-  // X-axis labels: 3 date markers
-  const xLabelIdxs = [0, Math.floor((n - 1) / 2), n - 1];
-
-  // Hover handling: smooth cursor following with linear interpolation
+  // Hover handling: smooth cursor following with time-based lookup
+  const bisectDateComp = d3.bisector(d => new Date(d.t)).left;
   const handleMove = e => {
     const rect = e.currentTarget.getBoundingClientRect();
     const px = e.clientX - rect.left;
     const clampedPx = Math.max(padL, Math.min(padL + iw, px));
-    // Find fractional index based on x position
-    const fracIdx = ((clampedPx - padL) / iw) * (n - 1);
-    const i0 = Math.floor(fracIdx);
-    const i1 = Math.min(n - 1, i0 + 1);
-    const frac = fracIdx - i0;
-    // Interpolate value smoothly
-    const interpV = vals[i0] + (vals[i1] - vals[i0]) * frac;
-    // Snap to nearest actual point for tooltip data (date)
-    const nearestIdx = (fracIdx - i0 < 0.5) ? i0 : i1;
-    // Compute pct change from first point in range
-    const pct = first > 0 ? ((interpV - first) / first) * 100 : 0;
-    setHover({ x: clampedPx, y: yAt(interpV), idx: nearestIdx, v: interpV, t: pts[nearestIdx].t, pct });
-    onHover && onHover({ t: pts[nearestIdx].t, v: history[nearestIdx].v });
+
+    const x0 = xScaleT.invert(clampedPx);
+    const i = bisectDateComp(pts, x0, 1);
+    const p0 = pts[i - 1], p1 = pts[i];
+    if (!p0) return;
+    const p = (p1 && (x0 - new Date(p0.t) > new Date(p1.t) - x0)) ? p1 : p0;
+
+    const v = p.v;
+    const pct = first > 0 ? ((v - first) / first) * 100 : 0;
+    setHover({ x: xScaleT(new Date(p.t)), y: yAt(v), v: v, t: p.t, pct });
+    onHover && onHover({ t: p.t, v: history[pts.indexOf(p)].v });
   };
   const handleLeave = () => {
     setHover(null);
@@ -5695,15 +5710,15 @@ function DChart({ history, onHover, lang: compLang }) {
         <path d={linePath} fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
 
         {/* X-axis date labels */}
-        {xLabelIdxs.map(i => (
+        {xScaleT.ticks(4).map((d, i) => (
           <text
             key={i}
-            x={xAt(i)}
+            x={xScaleT(d)}
             y={padT + ih + 16}
-            textAnchor={i === 0 ? 'start' : i === n - 1 ? 'end' : 'middle'}
+            textAnchor="middle"
             fontSize="10"
             fill="var(--text3)"
-          >{new Date(pts[i].t).toLocaleDateString('uk-UA', { day: '2-digit', month: 'short' })}</text>
+          >{d.toLocaleDateString('uk-UA', { day: '2-digit', month: 'short' })}</text>
         ))}
 
         {/* Hover overlay */}
