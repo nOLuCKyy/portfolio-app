@@ -2003,7 +2003,14 @@ function renderChart(){
   const iw=W-margin.left-margin.right, ih=H-margin.top-margin.bottom;
 
   // Time-based scale to fix compression issues
-  const xScale=d3.scaleTime().domain(d3.extent(parsed, d => d.t)).range([0,iw]);
+  let xDomain = d3.extent(parsed, d => d.t);
+  if (S.chartRange === "1d" && parsed.length > 0) {
+    const d0 = new Date(parsed[0].t);
+    const dStart = new Date(d0.getTime()); dStart.setHours(9, 0, 0, 0);
+    const dEnd = new Date(d0.getTime()); dEnd.setHours(21, 0, 0, 0);
+    xDomain = [d3.min([d0, dStart]), d3.max([new Date(parsed[parsed.length - 1].t), dEnd])];
+  }
+  const xScale=d3.scaleTime().domain(xDomain).range([0,iw]);
   const yScale=d3.scaleLinear().domain([d3.min(parsed,d=>d.v)*0.998,d3.max(parsed,d=>d.v)*1.002]).range([ih,0]);
 
   const lineGen=d3.line().x(d=>xScale(d.t)).y(d=>yScale(d.v)).curve(d3.curveCatmullRom);
@@ -5576,7 +5583,7 @@ function dFilterHistory(range) {
 }
 
 // ── Chart ─────────────────────────────────────────────────────────────────────
-function DChart({ history, onHover, lang: compLang }) {
+function DChart({ history, range, onHover, lang: compLang }) {
   window._currentLang = compLang || window.appLang || 'uk';
   const ref = useRef(null);
   const svgRef = useRef(null);
@@ -5612,7 +5619,14 @@ function DChart({ history, onHover, lang: compLang }) {
   const yScale = yMax - yMin || 1;
 
   // X-scale: time-based to show correct proportions
-  const xScaleT = d3.scaleTime().domain(d3.extent(pts, p => new Date(p.t))).range([padL, padL + iw]);
+  let xDomainT = d3.extent(pts, p => new Date(p.t));
+  if (range === '1d' && pts.length > 0) {
+    const d0 = new Date(pts[0].t);
+    const dStart = new Date(d0.getTime()); dStart.setHours(9, 0, 0, 0);
+    const dEnd = new Date(d0.getTime()); dEnd.setHours(21, 0, 0, 0);
+    xDomainT = [d3.min([d0, dStart]), d3.max([new Date(pts[pts.length - 1].t), dEnd])];
+  }
+  const xScaleT = d3.scaleTime().domain(xDomainT).range([padL, padL + iw]);
   const yAt = v => padT + ih - ((v - yMin) / yScale) * ih;
 
   // Build line + area paths
@@ -6131,7 +6145,7 @@ function Dashboard() {
             <button className="d-range-btn" style={{color:'var(--accent)'}} onClick={seedHistory}>↺</button>
           </div>
         </div>
-        <div style={{height:160}}><DChart lang={lang} history={history} onHover={setHovered}/></div>
+        <div style={{height:160}}><DChart lang={lang} range={range} history={history} onHover={setHovered}/></div>
       </div>
       <div style={{marginTop:8}}>
         <div style={{fontSize:11,fontWeight:600,color:'var(--text2)',marginBottom:6,textTransform:'uppercase',letterSpacing:'.06em'}}>{t('todayMovers')}</div>
@@ -6209,7 +6223,7 @@ function Dashboard() {
               </div>
             </div>
             <div style={{flex:1,minHeight:180,marginRight:'-14px',paddingRight:'14px'}}>
-              <DChart lang={lang} history={history} onHover={setHovered}/>
+              <DChart lang={lang} range={range} history={history} onHover={setHovered}/>
             </div>
           </div>
         </div>
